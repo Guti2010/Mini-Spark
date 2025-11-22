@@ -1,0 +1,21 @@
+# Etapa de build: compilamos el binario "worker"
+FROM rust:1.85 AS builder
+
+WORKDIR /app
+COPY . .
+
+WORKDIR /app/sparkmini
+RUN cargo build --release -p worker
+
+# Etapa de runtime
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /app/sparkmini/target/release/worker /usr/local/bin/worker
+
+CMD ["worker"]

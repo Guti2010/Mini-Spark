@@ -1,0 +1,29 @@
+# Etapa de build: compilamos el binario "master"
+FROM rust:1.85 AS builder
+
+WORKDIR /app
+# Copiamos todo el proyecto
+COPY . .
+
+# Entramos al workspace de Rust
+WORKDIR /app/sparkmini
+
+# Compilamos solo el binario master en modo release
+RUN cargo build --release -p master
+
+# Etapa de runtime: imagen más liviana solo con el binario
+FROM debian:bookworm-slim
+
+# Certificados (por si algún día usamos HTTPS)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copiamos el binario ya compilado
+COPY --from=builder /app/sparkmini/target/release/master /usr/local/bin/master
+
+EXPOSE 8080
+
+CMD ["master"]

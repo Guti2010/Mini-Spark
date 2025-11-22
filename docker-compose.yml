@@ -1,0 +1,54 @@
+services:
+  # Contenedor de desarrollo (con Rust + toolchain)
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: mini-spark-dev
+    working_dir: /app
+    volumes:
+      - .:/app
+    stdin_open: true
+    tty: true
+    environment:
+      - MASTER_URL=http://master:8080
+
+  # Master: coordinador del sistema
+  master:
+    build:
+      context: .
+      dockerfile: Dockerfile.master
+    container_name: mini-spark-master
+    # Expone el puerto 8080 del master en tu máquina
+    ports:
+      - "8080:8080"
+    # Carpeta compartida para datos (la puedes crear después)
+    volumes:
+      - ./data:/data
+
+  # Primer worker
+  worker1:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: mini-spark-worker1
+    depends_on:
+      - master
+    environment:
+      # Aquí es donde usamos el MASTER_URL que lee el worker
+      - MASTER_URL=http://master:8080
+    volumes:
+      - ./data:/data
+
+  # Segundo worker
+  worker2:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: mini-spark-worker2
+    depends_on:
+      - master
+    environment:
+      - MASTER_URL=http://master:8080
+    volumes:
+      - ./data:/data
