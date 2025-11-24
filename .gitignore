@@ -1,0 +1,29 @@
+# ------------------------------------
+# Rust / Cargo
+# ------------------------------------
+# Directorios de build (debug/release), generados por Cargo
+/target
+**/target/
+
+# Archivos de respaldo que a veces crea rustfmt o editores
+**/*.rs.bk
+
+# ------------------------------------
+# Archivos de entorno / herramientas
+# ------------------------------------
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# IntelliJ / CLion / RustRover
+.idea/
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
+
+# Si se llegan a generar dumps temporales
+dump.sql
+*.tmp
+
