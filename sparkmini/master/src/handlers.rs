@@ -13,6 +13,7 @@ use common::{
 use glob::glob;
 use std::fs;
 use tracing::info;
+use chrono::Utc;
 
 use crate::state::{AppState, InFlight, WorkerMeta};
 use crate::MAX_TASK_ATTEMPTS;
@@ -43,14 +44,17 @@ async fn create_job(
 ) -> Json<JobInfo> {
     use common::Task;
 
+    // 1) ID de job y directorio de salida
     let job_id = uuid::Uuid::new_v4().to_string();
-
-    // Directorio de salida específico de este job
     let job_output_dir = format!("{}/{}", req.output_dir, job_id);
+    let _ = fs::create_dir_all(&job_output_dir);
 
+    // 2) Construir tareas
     let mut tasks_for_job: Vec<Task> = Vec::new();
 
-    // Para cada archivo que haga match con el glob, creamos una tarea
+    let par = req.parallelism.max(1);
+    let mut next_partition: u32 = 0;
+
     for entry in glob(&req.input_glob).expect("patrón input_glob inválido") {
         if let Ok(path) = entry {
             if path.is_file() {
@@ -60,11 +64,17 @@ async fn create_job(
                 let file_name = path.file_name().unwrap().to_string_lossy();
                 let output_path = format!("{}/{}", job_output_dir, file_name);
 
+                let partition = next_partition % par;
+                next_partition += 1;
+
                 let t = Task {
                     id: uuid::Uuid::new_v4().to_string(),
                     job_id: job_id.clone(),
                     node_id: "wordcount".to_string(),
                     attempt: 0,
+                    stage: 0,
+                    partition,
+                    parallelism: par,
                     input_path,
                     output_path,
                 };
@@ -73,20 +83,43 @@ async fn create_job(
         }
     }
 
-    let initial_status = if tasks_for_job.is_empty() {
-        JobStatus::Succeeded // nada que hacer
+    // 3) Métricas iniciales
+    let total_tasks = tasks_for_job.len() as u32;
+
+    let initial_status = if total_tasks == 0 {
+        JobStatus::Succeeded
     } else {
         JobStatus::Accepted
     };
 
-    let job_info = JobInfo {
-        id: job_id.clone(),
-        name: req.name,
-        status: initial_status,
-        input_glob: req.input_glob,
-        output_dir: job_output_dir.clone(),
+    let progress_pct = if total_tasks == 0 { 100.0 } else { 0.0 };
+    let started_at = None;
+    let finished_at = if total_tasks == 0 {
+        Some(chrono::Utc::now().to_rfc3339())
+    } else {
+        None
     };
 
+    // 4) JobInfo
+    let job_info = JobInfo {
+        id: job_id.clone(),
+        name: req.name.clone(),
+        status: initial_status,
+        dag: req.dag.clone(),
+        parallelism: req.parallelism,
+        input_glob: req.input_glob.clone(),
+        output_dir: job_output_dir.clone(),
+
+        total_tasks,
+        completed_tasks: 0,
+        failed_tasks: 0,
+        retries: 0,
+        progress_pct,
+        started_at,
+        finished_at,
+    };
+
+    // 5) Guardar job y encolar tareas
     {
         let mut jobs = state.jobs.lock().unwrap();
         jobs.insert(job_id.clone(), job_info.clone());
@@ -101,6 +134,8 @@ async fn create_job(
 
     Json(job_info)
 }
+
+
 
 // Devuelve info básica de un job
 async fn get_job(
@@ -198,7 +233,7 @@ async fn assign_task(
     let task_opt = queue.pop_front();
     drop(queue);
 
-    if let Some(ref t) = task_opt {
+        if let Some(ref t) = task_opt {
         info!(
             "asignando tarea {} (input={} output={}) al worker {}",
             t.id, t.input_path, t.output_path, req.worker_id
@@ -219,12 +254,16 @@ async fn assign_task(
         {
             let mut jobs = state.jobs.lock().unwrap();
             if let Some(job) = jobs.get_mut(&t.job_id) {
-                job.status = JobStatus::Running;
+                if matches!(job.status, JobStatus::Accepted) {
+                    job.status = JobStatus::Running;
+                    job.started_at = Some(Utc::now().to_rfc3339());
+                }
             }
         }
     } else {
         info!("worker {} pidió tarea pero no hay", req.worker_id);
     }
+
 
     Json(TaskAssignmentResponse { task: task_opt })
 }
@@ -246,20 +285,50 @@ async fn complete_task(
 
         // Si la tarea falló, intentamos re-encolar hasta MAX_TASK_ATTEMPTS
         if !req.success {
+            // Contabilizamos reintento
+            {
+                let mut jobs = state.jobs.lock().unwrap();
+                if let Some(job) = jobs.get_mut(&job_id) {
+                    job.retries += 1;
+                }
+            }
+
             if task.attempt + 1 <= MAX_TASK_ATTEMPTS {
                 task.attempt += 1;
                 let mut queue = state.tasks_queue.lock().unwrap();
                 queue.push_back(task);
             } else {
+                // Sin más reintentos: marcamos fallo definitivo
                 let mut jobs = state.jobs.lock().unwrap();
                 if let Some(job) = jobs.get_mut(&job_id) {
                     job.status = JobStatus::Failed;
+                    job.failed_tasks += 1;
+                    job.progress_pct = if job.total_tasks == 0 {
+                        100.0
+                    } else {
+                        (job.completed_tasks as f32 / job.total_tasks as f32) * 100.0
+                    };
+                    job.finished_at = Some(Utc::now().to_rfc3339());
                 }
             }
             return Ok(Json(TaskCompleteResponse { ok: true }));
         }
 
-        // Caso éxito: verificamos si ya no quedan tareas de ese job
+        // Caso éxito: aumentamos contador de tareas completadas
+        {
+            let mut jobs = state.jobs.lock().unwrap();
+            if let Some(job) = jobs.get_mut(&job_id) {
+                job.completed_tasks += 1;
+                if job.total_tasks == 0 {
+                    job.progress_pct = 100.0;
+                } else {
+                    job.progress_pct =
+                        (job.completed_tasks as f32 / job.total_tasks as f32) * 100.0;
+                }
+            }
+        }
+
+        // Verificamos si ya no quedan tareas de ese job
         let queue_has_for_job = {
             let queue = state.tasks_queue.lock().unwrap();
             queue.iter().any(|t| t.job_id == job_id)
@@ -274,6 +343,8 @@ async fn complete_task(
             let mut jobs = state.jobs.lock().unwrap();
             if let Some(job) = jobs.get_mut(&job_id) {
                 job.status = JobStatus::Succeeded;
+                job.finished_at = Some(Utc::now().to_rfc3339());
+                job.progress_pct = 100.0;
             }
         }
 
@@ -283,3 +354,4 @@ async fn complete_task(
         Err(StatusCode::NOT_FOUND)
     }
 }
+

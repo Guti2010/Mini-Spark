@@ -1,74 +1,85 @@
 use anyhow::Result;
 use common::{
-    wordcount, TaskAssignmentRequest, TaskAssignmentResponse, TaskCompleteRequest,
-    WorkerHeartbeatRequest, WorkerRegisterRequest, WorkerRegisterResponse,
+    TaskAssignmentRequest,
+    TaskAssignmentResponse,
+    TaskCompleteRequest,
+    WorkerHeartbeatRequest,
+    WorkerRegisterRequest,
+    WorkerRegisterResponse,
 };
 use hostname;
 use reqwest::Client;
-use std::{env, time::Duration};
+use std::{env, sync::Arc, time::Duration};
+use tokio::sync::Semaphore;
+use tokio::time::sleep;
 use tracing::{info, warn};
 use tracing_subscriber;
 
-/// Obtiene la URL base del master.
-/// - En Docker: MASTER_URL=http://master:8080
-/// - Local: default http://localhost:8080
-fn master_base_url() -> String {
-    env::var("MASTER_URL").unwrap_or_else(|_| "http://localhost:8080".to_string())
-}
+use common::engine;
 
+/// Loop principal del worker.
+/// - Se registra en el master.
+/// - Hace heartbeats periódicos.
+/// - Pide tareas mientras tenga "slots" libres.
+/// - Ejecuta cada tarea en paralelo (hasta WORKER_CONCURRENCY).
 pub async fn run() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("worker=debug,reqwest=info")
-        .init();
+    tracing_subscriber::fmt::init();
 
+    let base_url =
+        env::var("MASTER_BASE_URL").unwrap_or_else(|_| "http://master:8080".to_string());
     let client = Client::new();
-    let base_url = master_base_url();
 
-    // Nombre de host (solo para info)
-    let hostname_str = hostname::get()
+    let hostname = hostname::get()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
 
-    // 1) Registrarse en el master
+    // Registro de worker
     let register_url = format!("{}/api/v1/workers/register", base_url);
     let res = client
         .post(&register_url)
-        .json(&WorkerRegisterRequest {
-            hostname: hostname_str,
-        })
+        .json(&WorkerRegisterRequest { hostname })
         .send()
         .await?;
+    let WorkerRegisterResponse { worker_id } = res.json().await?;
 
-    let register_resp: WorkerRegisterResponse = res.json().await?;
-    let worker_id = register_resp.worker_id;
-    info!("worker registrado con id = {}", worker_id);
+    // Concurrencia del worker (cuántas tareas procesa en paralelo)
+    let concurrency: usize = env::var("WORKER_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
 
-    // 1.5) Lanzar heartbeat periódico en background
-    {
-        let hb_client = client.clone();
-        let hb_base = base_url.clone();
-        let hb_worker_id = worker_id.clone();
+    info!(
+        "worker {} registrado con concurrency={} contra {}",
+        worker_id, concurrency, base_url
+    );
 
-        tokio::spawn(async move {
-            let url = format!("{}/api/v1/workers/heartbeat", hb_base);
-            loop {
-                let _ = hb_client
-                    .post(&url)
-                    .json(&WorkerHeartbeatRequest {
-                        worker_id: hb_worker_id.clone(),
-                    })
-                    .send()
-                    .await;
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        });
-    }
+    let sem = Arc::new(Semaphore::new(concurrency));
 
-    // 2) Loop infinito pidiendo tareas
     loop {
+        // Heartbeat al master
+        let hb_url = format!("{}/api/v1/workers/heartbeat", base_url);
+        let _ = client
+            .post(&hb_url)
+            .json(&WorkerHeartbeatRequest {
+                worker_id: worker_id.clone(),
+            })
+            .send()
+            .await;
+
+        // Intentar reservar un "slot" de concurrencia
+        let permit = match sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                // No hay capacidad para nuevas tareas; esperamos un poco
+                sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+
+        // Pedimos tarea al master
         let assign_url = format!("{}/api/v1/tasks/next", base_url);
-        let resp = client
+        let res = client
             .post(&assign_url)
             .json(&TaskAssignmentRequest {
                 worker_id: worker_id.clone(),
@@ -76,7 +87,7 @@ pub async fn run() -> Result<()> {
             .send()
             .await?;
 
-        let assignment: TaskAssignmentResponse = resp.json().await?;
+        let assignment: TaskAssignmentResponse = res.json().await?;
 
         if let Some(task) = assignment.task {
             info!(
@@ -84,29 +95,61 @@ pub async fn run() -> Result<()> {
                 task.id, task.job_id, task.input_path, task.output_path
             );
 
-            // Ejecutar WordCount
-            let result = wordcount::wordcount_file(&task.input_path, &task.output_path);
-            let success = result.is_ok();
+            // Clonar lo que usamos en la tarea asíncrona
+            let client_cloned = client.clone();
+            let base_url_cloned = base_url.clone();
 
-            if let Err(err) = result {
-                warn!("error procesando tarea {}: {:?}", task.id, err);
-            } else {
-                info!("terminé tarea {} correctamente", task.id);
-            }
+            // Lanzamos la ejecución de la tarea en paralelo
+            tokio::spawn(async move {
+                let tmp_dir = "/data/tmp".to_string();
+                let input_path = task.input_path.clone();
+                let output_path = task.output_path.clone();
+                let num_partitions = task.parallelism.max(1);
 
-            // Reportar al master
-            let complete_url = format!("{}/api/v1/tasks/complete", base_url);
-            let _ = client
-                .post(&complete_url)
-                .json(&TaskCompleteRequest {
-                    task_id: task.id.clone(),
-                    success,
-                })
-                .send()
-                .await?;
+                // Ejecutar el WordCount "Spark-like" en un hilo de bloqueo
+                let handle = tokio::task::spawn_blocking(move || {
+                    engine::wordcount_file_shuffled_local(
+                        &input_path,
+                        &tmp_dir,
+                        num_partitions,
+                        &output_path,
+                    )
+                });
+
+                let success = match handle.await {
+                    Ok(Ok(())) => {
+                        info!("terminé tarea {} correctamente", task.id);
+                        true
+                    }
+                    Ok(Err(e)) => {
+                        warn!("error procesando tarea {}: {:?}", task.id, e);
+                        false
+                    }
+                    Err(e) => {
+                        warn!("panic o join error en tarea {}: {:?}", task.id, e);
+                        false
+                    }
+                };
+
+                // Reportar al master que terminamos
+                let complete_url = format!("{}/api/v1/tasks/complete", base_url_cloned);
+                let _ = client_cloned
+                    .post(&complete_url)
+                    .json(&TaskCompleteRequest {
+                        task_id: task.id.clone(),
+                        success,
+                    })
+                    .send()
+                    .await;
+
+                // Liberar el "slot" de concurrencia al terminar
+                drop(permit);
+            });
         } else {
-            warn!("no hay tareas, esperando 1s...");
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            // No hay tarea: devolvemos el permiso y dormimos
+            drop(permit);
+            info!("worker {} pidió tarea pero no hay", worker_id);
+            sleep(Duration::from_secs(2)).await;
         }
     }
 }

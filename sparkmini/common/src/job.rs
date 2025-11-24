@@ -1,13 +1,23 @@
 use serde::{Deserialize, Serialize};
 
+use crate::dag::Dag;
+
 pub type JobId = String;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobRequest {
     pub name: String,
+
+    /// DAG de operadores (map, filter, flat_map, reduce_by_key, join, etc.)
+    pub dag: Dag,
+
+    /// Paralelismo deseado (particiones / tasks en paralelo)
+    pub parallelism: u32,
+
     /// Patrón de archivos de entrada, ej: "/data/input/*.txt"
     pub input_glob: String,
-    /// Directorio base de salida (ej: "/data/output")
+
+    /// Directorio base de salida, ej: "/data/output"
     pub output_dir: String,
 }
 
@@ -25,8 +35,34 @@ pub struct JobInfo {
     pub id: JobId,
     pub name: String,
     pub status: JobStatus,
-    /// El glob de entrada que se usó para generar las tareas
+
+    /// DAG original que se envió para este job
+    pub dag: Dag,
+
+    /// Paralelismo configurado para el job
+    pub parallelism: u32,
+
+    /// Glob de entrada y directorio de salida concreto del job
     pub input_glob: String,
-    /// Directorio de salida específico de este job, ej: "/data/output/<job_id>"
     pub output_dir: String,
+
+    /// -------- Métricas del job --------
+    /// Número total de tareas creadas para este job
+    pub total_tasks: u32,
+
+    /// Tareas que han terminado con éxito
+    pub completed_tasks: u32,
+
+    /// Tareas que terminaron definitivamente en fallo (sin más reintentos)
+    pub failed_tasks: u32,
+
+    /// Cantidad de reintentos totales en todas las tareas
+    pub retries: u32,
+
+    /// Progreso aproximado en porcentaje [0, 100]
+    pub progress_pct: f32,
+
+    /// Tiempos (en formato RFC3339, opcionales)
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
 }

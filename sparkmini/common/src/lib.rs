@@ -4,8 +4,8 @@ pub mod task;
 pub mod worker;
 pub mod results;
 pub mod wordcount;
+pub mod engine; // ya lo teníamos
 
-// Re-export para que el resto del código siga usando common::JobRequest, etc.
 pub use job::{JobId, JobInfo, JobRequest, JobStatus};
 pub use dag::{Dag, DagNode};
 pub use task::{Task, TaskId};
@@ -21,3 +21,6 @@ pub use worker::{
     TaskCompleteResponse,
 };
 pub use results::JobResults;
+
+// Re-export del motor de datos
+pub use engine::{Record, Records, Partition};

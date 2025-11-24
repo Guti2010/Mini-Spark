@@ -1,7 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use common::{JobInfo, JobRequest, JobResults};
+use common::{Dag, DagNode, JobInfo, JobRequest, JobResults};
 use reqwest::Client;
+use std::collections::HashMap;
 use std::env;
 
 /// Igual que en el worker:
@@ -38,6 +39,63 @@ enum Commands {
     },
 }
 
+/// Construye un DAG fijo de WordCount:
+/// read_text -> flat_map(tokenize) -> map(to_lower) -> reduce_by_key(sum)
+///
+/// Devuelve: (dag, input_glob, output_dir)
+fn build_wordcount_dag() -> (Dag, String, String) {
+    let input_glob = "/data/input/*.txt".to_string();
+    let output_dir = "/data/output".to_string();
+
+    // Nodo "read": lee texto desde input_glob
+    let mut read_params = HashMap::new();
+    read_params.insert("path".to_string(), input_glob.clone());
+    read_params.insert("format".to_string(), "text".to_string());
+    // ejemplo de particiones; más adelante lo podemos hacer dinámico
+    read_params.insert("partitions".to_string(), "4".to_string());
+
+    let read = DagNode {
+        id: "read".to_string(),
+        op: "read_text".to_string(),
+        params: read_params,
+    };
+
+    // Nodo "flat": flat_map(tokenize)
+    let flat = DagNode {
+        id: "flat".to_string(),
+        op: "flat_map".to_string(),
+        params: HashMap::new(), // más adelante podríamos poner "fn": "tokenize"
+    };
+
+    // Nodo "map1": map(to_lower)
+    let map1 = DagNode {
+        id: "map1".to_string(),
+        op: "map".to_string(),
+        params: HashMap::new(), // ej: {"fn": "to_lower"}
+    };
+
+    // Nodo "agg": reduce_by_key(sum)
+    let mut agg_params = HashMap::new();
+    agg_params.insert("fn".to_string(), "sum".to_string());
+    let agg = DagNode {
+        id: "agg".to_string(),
+        op: "reduce_by_key".to_string(),
+        params: agg_params,
+    };
+
+    let dag = Dag {
+        nodes: vec![read, flat, map1, agg],
+        edges: vec![
+            ("read".to_string(), "flat".to_string()),
+            ("flat".to_string(), "map1".to_string()),
+            ("map1".to_string(), "agg".to_string()),
+        ],
+    };
+
+    (dag, input_glob, output_dir)
+}
+
+
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let client = Client::new();
@@ -47,13 +105,15 @@ pub async fn run() -> Result<()> {
         Commands::Submit { name } => {
             let url = format!("{}/api/v1/jobs", base_url);
 
-            // Defaults:
-            // - lee /data/input/*.txt
-            // - escribe en /data/output/<job_id>/
+            // Construimos el DAG fijo de WordCount y los paths de entrada/salida
+            let (dag, input_glob, output_dir) = build_wordcount_dag();
+
             let req = JobRequest {
                 name,
-                input_glob: "/data/input/*.txt".to_string(),
-                output_dir: "/data/output".to_string(),
+                dag,
+                parallelism: 4, // por ahora fijo; luego lo hacemos parámetro
+                input_glob,
+                output_dir,
             };
 
             let resp = client.post(&url).json(&req).send().await?;
@@ -63,25 +123,40 @@ pub async fn run() -> Result<()> {
             println!("  id: {}", job_info.id);
             println!("  nombre: {}", job_info.name);
             println!("  estado: {:?}", job_info.status);
+            println!("  parallelism: {}", job_info.parallelism);
             println!("  input_glob: {}", job_info.input_glob);
             println!("  output_dir: {}", job_info.output_dir);
         }
-        Commands::Status { id } => {
-            let url = format!("{}/api/v1/jobs/{id}", base_url);
-            let resp = client.get(&url).send().await?;
 
+
+        Commands::Status { id } => {
+            let url = format!("{}/api/v1/jobs/{}", base_url, id);
+            let resp = client.get(&url).send().await?;
             if resp.status().is_success() {
-                let job_info: JobInfo = resp.json().await?;
+                let job: JobInfo = resp.json().await?;
                 println!("Job:");
-                println!("  id: {}", job_info.id);
-                println!("  nombre: {}", job_info.name);
-                println!("  estado: {:?}", job_info.status);
-                println!("  input_glob: {}", job_info.input_glob);
-                println!("  output_dir: {}", job_info.output_dir);
+                println!("  id: {}", job.id);
+                println!("  nombre: {}", job.name);
+                println!("  estado: {:?}", job.status);
+                println!("  progreso: {:.1}%", job.progress_pct);
+                println!(
+                    "  tareas: {}/{} completadas, {} fallidas, {} reintentos",
+                    job.completed_tasks, job.total_tasks, job.failed_tasks, job.retries
+                );
+                println!("  input_glob: {}", job.input_glob);
+                println!("  output_dir: {}", job.output_dir);
+                if let Some(ref started) = job.started_at {
+                    println!("  iniciado: {}", started);
+                }
+                if let Some(ref done) = job.finished_at {
+                    println!("  finalizado: {}", done);
+                }
             } else {
-                println!("No se encontró el job con id {id}");
+                println!("Error: job no encontrado (status {})", resp.status());
             }
         }
+
+
         Commands::Results { id } => {
             let url = format!("{}/api/v1/jobs/{id}/results", base_url);
             let resp = client.get(&url).send().await?;
