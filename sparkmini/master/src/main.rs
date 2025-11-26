@@ -1,17 +1,18 @@
-mod state;
+// master/src/main.rs
+
 mod handlers;
-mod monitor;
+mod state;
+mod failover; // 👈 importante
 
 use crate::state::AppState;
-use std::collections::HashMap;
 use tokio::net::TcpListener;
 use tracing::info;
-use tracing_subscriber;
 
-use common::JobInfo;
-
-pub const WORKER_DEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+// ---------- constantes que usa failover.rs ----------
 pub const MAX_TASK_ATTEMPTS: u32 = 3;
+pub const WORKER_HEARTBEAT_TIMEOUT_SECS: u64 = 10;
+pub const FAILOVER_SWEEP_INTERVAL_SECS: u64 = 3;
+// ----------------------------------------------------
 
 #[tokio::main]
 async fn main() {
@@ -19,24 +20,26 @@ async fn main() {
         .with_env_filter("master=debug,axum=info")
         .init();
 
-    let state = AppState {
-        jobs: std::sync::Arc::new(std::sync::Mutex::new(HashMap::<String, JobInfo>::new())),
-        workers: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-        tasks_queue: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
-        in_flight: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-    };
+    // Estado compartido del master
+    let state = AppState::new();
 
-    // router HTTP
+    // Router HTTP
     let app = handlers::build_router(state.clone());
 
-    // monitor de heartbeats en segundo plano
-    let monitor_state = state.clone();
+    // Loop de failover / heartbeats en segundo plano
+    let failover_state = state.clone();
     tokio::spawn(async move {
-        monitor::monitor_workers(monitor_state).await;
+        failover::run_failover_loop(failover_state).await;
     });
 
-    let listener = TcpListener::bind("0.0.0.0:8080").await.unwrap();
+    // Servidor HTTP
+    let listener = TcpListener::bind("0.0.0.0:8080")
+        .await
+        .expect("no se pudo bindear el puerto 8080");
+
     info!("master escuchando en {}", listener.local_addr().unwrap());
 
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .await
+        .expect("error sirviendo axum");
 }

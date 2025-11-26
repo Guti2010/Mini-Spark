@@ -1,3 +1,5 @@
+// master/src/state.rs
+
 use common::{JobId, JobInfo, Task, TaskId, WorkerId};
 use std::{
     collections::{HashMap, VecDeque},
@@ -13,6 +15,17 @@ pub struct AppState {
     pub tasks_queue: Arc<Mutex<VecDeque<Task>>>,
     // tareas ya asignadas pero no completadas
     pub in_flight: Arc<Mutex<HashMap<TaskId, InFlight>>>,
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        Self {
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            workers: Arc::new(Mutex::new(HashMap::new())),
+            tasks_queue: Arc::new(Mutex::new(VecDeque::new())),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
