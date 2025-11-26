@@ -41,48 +41,51 @@ enum Commands {
     Workers,
 }
 
-/// Construye un DAG fijo de WordCount:
-/// read_text -> flat_map(tokenize) -> map(to_lower) -> reduce_by_key(sum)
-///
+/// Construye un DAG fijo de WordCount estilo enunciado:
+/// read -> flat -> map1 -> agg
 /// Devuelve: (dag, input_glob)
 fn build_wordcount_dag() -> (Dag, String) {
-    // patrón de entrada que el master va a usar para crear tareas
-    let input_glob = "/data/input/*.txt".to_string();
+    // Patrón de entrada que usará el master para crear tareas
+    let input_glob = "/data/input/*".to_string();
 
-    // Nodo "read": lee texto desde input_glob
-    let mut read_params = HashMap::new();
-    read_params.insert("path".to_string(), input_glob.clone());
-    read_params.insert("format".to_string(), "text".to_string());
-    // ejemplo de particiones; más adelante lo podemos hacer dinámico
-    read_params.insert("partitions".to_string(), "4".to_string());
-
+    // Nodo "read": lee archivos de texto (podría ser read_csv si usas CSV)
     let read = DagNode {
         id: "read".to_string(),
-        op: "read_text".to_string(),
-        params: read_params,
+        op: "read_text".to_string(),      // o "read_csv" si quieres CSV
+        path: Some(input_glob.clone()),   // igual al input_glob del job
+        partitions: Some(4),              // mismo valor que parallelism
+        fn_name: None,
+        key: None,
     };
 
     // Nodo "flat": flat_map(tokenize)
     let flat = DagNode {
         id: "flat".to_string(),
         op: "flat_map".to_string(),
-        params: HashMap::new(), // más adelante podríamos poner "fn": "tokenize"
+        path: None,
+        partitions: None,
+        fn_name: Some("tokenize".to_string()),
+        key: None,
     };
 
     // Nodo "map1": map(to_lower)
     let map1 = DagNode {
         id: "map1".to_string(),
         op: "map".to_string(),
-        params: HashMap::new(), // ej: {"fn": "to_lower"}
+        path: None,
+        partitions: None,
+        fn_name: Some("to_lower".to_string()),
+        key: None,
     };
 
-    // Nodo "agg": reduce_by_key(sum)
-    let mut agg_params = HashMap::new();
-    agg_params.insert("fn".to_string(), "sum".to_string());
+    // Nodo "agg": reduce_by_key(sum) usando key="token"
     let agg = DagNode {
         id: "agg".to_string(),
         op: "reduce_by_key".to_string(),
-        params: agg_params,
+        path: None,
+        partitions: None,
+        fn_name: Some("sum".to_string()),
+        key: Some("token".to_string()),
     };
 
     let dag = Dag {
@@ -96,6 +99,7 @@ fn build_wordcount_dag() -> (Dag, String) {
 
     (dag, input_glob)
 }
+
 
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();

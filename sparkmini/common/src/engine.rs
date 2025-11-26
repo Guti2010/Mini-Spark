@@ -7,6 +7,8 @@ use std::{
     path::Path,
 };
 
+use crate::dag::Dag;
+
 /// Tipo genérico de registro (fila de datos).
 /// Usamos JSON para poder representar texto, CSV, JSONL, etc.
 pub type Record = Value;
@@ -21,7 +23,9 @@ pub struct Partition {
     pub path: String,
 }
 
-/* ---------------- operadores genéricos ---------------- */
+/* =========================
+   Operadores genéricos
+   ========================= */
 
 /// map: aplica una función a cada registro y devuelve una nueva colección.
 pub fn op_map<F>(input: Records, f: F) -> Records
@@ -86,7 +90,77 @@ pub fn op_reduce_by_key(input: Records, key_field: &str, value_field: &str) -> R
         .collect()
 }
 
-/* ---------------- JOIN en memoria ---------------- */
+/* =========================
+   DEMO: WordCount usando operadores (map / flat_map / filter / reduce_by_key)
+   ========================= */
+
+/// map: línea de texto -> Record { "text": <línea> }
+fn wc_map_line_to_record(line: &str) -> Record {
+    json!({ "text": line })
+}
+
+/// flat_map: Record {"text": "..."} -> varios Records {"token": <palabra>, "count": 1}
+fn wc_flat_map_tokenize(rec: &Record) -> Vec<Record> {
+    let mut out = Vec::new();
+
+    let text = rec
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    for raw in text.split_whitespace() {
+        let cleaned: String = raw
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<String>()
+            .to_lowercase();
+
+        if !cleaned.is_empty() {
+            out.push(json!({
+                "token": cleaned,
+                "count": 1_u64,
+            }));
+        }
+    }
+
+    out
+}
+
+/// filter: dejar sólo Records con "token" no vacío.
+fn wc_filter_nonempty(rec: &Record) -> bool {
+    rec.get("token")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Pipeline completo de WordCount en memoria,
+/// usando explícitamente map -> flat_map -> filter -> reduce_by_key.
+/// Esto es tu "mini-Spark" en pequeño.
+pub fn wordcount_from_lines_with_operators<I>(lines: I) -> Records
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    // map: línea -> { "text": línea }
+    let recs0: Records = lines
+        .into_iter()
+        .map(|l| wc_map_line_to_record(l.as_ref()))
+        .collect();
+
+    // flat_map: {text} -> {token,count=1}*
+    let recs1 = op_flat_map(recs0, wc_flat_map_tokenize);
+
+    // filter: tokens no vacíos
+    let recs2 = op_filter(recs1, wc_filter_nonempty);
+
+    // reduce_by_key(token, count)
+    op_reduce_by_key(recs2, "token", "count")
+}
+
+/* =========================
+   JOIN en memoria
+   ========================= */
 
 /// Fusiona dos registros JSON en uno solo.
 /// - el campo `key_field` se mantiene una sola vez
@@ -156,7 +230,9 @@ pub fn op_join_by_key(left: Records, right: Records, key_field: &str) -> Records
     out
 }
 
-/* ---------------- Lectura de archivos a Records ---------------- */
+/* =========================
+   Lectura de archivos a Records
+   ========================= */
 
 pub fn read_csv_to_records(path: &str) -> io::Result<Records> {
     let file = File::open(path)?;
@@ -213,7 +289,9 @@ pub fn read_jsonl_to_records(path: &str) -> io::Result<Records> {
     Ok(out)
 }
 
-/* ---------------- WordCount en memoria (una sola etapa) ---------------- */
+/* =========================
+   WordCount en memoria (versión simple)
+   ========================= */
 
 /// Etapa 1 de WordCount:
 ///   líneas -> registros { "token": <palabra_normalizada>, "count": 1 }
@@ -245,8 +323,8 @@ where
     recs
 }
 
-/// Pipeline completo de WordCount en memoria (sin particiones):
-/// líneas -> tokens -> reduce_by_key(token, count)
+/// Pipeline completo de WordCount en memoria (sin particiones),
+/// usando la etapa 1 + reduce_by_key.
 pub fn wordcount_from_lines<I>(lines: I) -> Records
 where
     I: IntoIterator,
@@ -341,8 +419,9 @@ pub fn wordcount_jsonl_file_shuffled_local(
     reduce_partitions_to_file(&partitions, "token", "count", output_path)
 }
 
-
-/* ---------------- shuffle a particiones en disco ---------------- */
+/* =========================
+   Shuffle a particiones en disco
+   ========================= */
 
 fn hash_key_to_partition(key: &str, num_partitions: u32) -> u32 {
     let mut h = DefaultHasher::new();
@@ -464,7 +543,9 @@ pub fn reduce_partitions_to_file(
     Ok(())
 }
 
-/* ---------------- demo local: WordCount con shuffle a particiones ---------------- */
+/* =========================
+   Demo local: WordCount con shuffle a particiones
+   ========================= */
 
 /// Pipeline de WordCount "estilo Spark" pero en un solo proceso:
 ///
@@ -487,13 +568,97 @@ pub fn wordcount_file_shuffled_local(
     let token_records = wc_stage1_make_token_records(lines);
 
     // 3) Shuffle: token -> particiones por hash(token)
-    let partitions = shuffle_to_partitions(token_records, "token", num_partitions, tmp_dir, "wc_stage1")?;
+    let partitions =
+        shuffle_to_partitions(token_records, "token", num_partitions, tmp_dir, "wc_stage1")?;
 
     // 4) Reduce: sum(count) por token en todas las particiones
     reduce_partitions_to_file(&partitions, "token", "count", output_path)
 }
 
-/* ---------------- JOIN sobre particiones en disco ---------------- */
+/* =========================
+   Ejecutar DAG de WordCount para un archivo
+   ========================= */
+
+/// Ejecuta un DAG de WordCount para **un solo archivo de entrada**.
+///
+/// Usa sólo el nodo de lectura:
+/// - busca un nodo `read_*`
+/// - interpreta `op` ("read_csv", "read_jsonl", "read_text", etc.)
+/// - usa `partitions` del nodo si viene; si no, usa `num_partitions` por defecto.
+///
+/// Por ahora asumimos:
+///   - CSV/JSONL tienen un campo `"text"` con el contenido.
+///   - El resto del pipeline (flat_map/map/reduce_by_key) está fijo para WordCount.
+pub fn execute_wordcount_dag_for_file(
+    dag: &Dag,
+    input_path: &str,
+    tmp_dir: &str,
+    default_num_partitions: u32,
+    output_path: &str,
+) -> io::Result<()> {
+    // 1) Buscar un nodo de lectura: op que empiece con "read_"
+    let read_node = dag
+        .nodes
+        .iter()
+        .find(|n| n.op.starts_with("read_"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "DAG sin nodo read_*"))?;
+
+    // 2) Número de particiones efectivo: el del nodo o el default
+    let num_partitions = read_node
+        .partitions
+        .unwrap_or(default_num_partitions)
+        .max(1);
+
+    // 3) Campo de texto para CSV/JSONL (por ahora fijo)
+    let text_field = "text";
+
+    // 4) Extensión del archivo (por si necesitamos inferir)
+    let ext = Path::new(input_path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // 5) Determinar formato a partir de op / extensión
+    let effective_format = match read_node.op.as_str() {
+        "read_csv" => "csv",
+        "read_jsonl" => "jsonl",
+        "read_json" => "json",
+        "read_text" | "read_text_glob" => "text",
+        _ => {
+            // fallback: inferimos por extensión
+            if ext == "csv" {
+                "csv"
+            } else if ext == "json" || ext == "jsonl" {
+                "jsonl"
+            } else {
+                "text"
+            }
+        }
+    };
+
+    match effective_format {
+        "csv" => wordcount_csv_file_shuffled_local(
+            input_path,
+            text_field,
+            tmp_dir,
+            num_partitions,
+            output_path,
+        ),
+        "jsonl" | "json" => wordcount_jsonl_file_shuffled_local(
+            input_path,
+            text_field,
+            tmp_dir,
+            num_partitions,
+            output_path,
+        ),
+        _ => wordcount_file_shuffled_local(input_path, tmp_dir, num_partitions, output_path),
+    }
+}
+
+/* =========================
+   JOIN sobre particiones en disco
+   ========================= */
 
 /// Inner join entre dos conjuntos de particiones ya "shuffeadas" por la misma clave.
 /// - `left_parts` y `right_parts` deben venir de `shuffle_to_partitions`
@@ -536,6 +701,43 @@ pub fn join_partitions_to_jsonl(
                 writer.write_all(b"\n")?;
             }
         }
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+/* =========================
+   DEMO: join in-memory sobre dos CSV por clave
+   ========================= */
+
+/// Join sencillo entre dos CSV por clave, usando op_join_by_key.
+/// - Lee ambos CSV a Records.
+/// - Hace inner join por `key_field`.
+/// - Escribe la salida como JSONL en `output_path`.
+pub fn join_csv_in_memory(
+    left_path: &str,
+    right_path: &str,
+    key_field: &str,
+    output_path: &str,
+) -> io::Result<()> {
+    let left = read_csv_to_records(left_path)?;
+    let right = read_csv_to_records(right_path)?;
+
+    let joined = op_join_by_key(left, right, key_field);
+
+    if let Some(parent) = Path::new(output_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let out = File::create(output_path)?;
+    let mut writer = BufWriter::new(out);
+
+    for rec in joined {
+        serde_json::to_writer(&mut writer, &rec)?;
+        writer.write_all(b"\n")?;
     }
 
     writer.flush()?;

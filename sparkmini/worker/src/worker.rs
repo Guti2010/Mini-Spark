@@ -1,5 +1,7 @@
 use anyhow::Result;
 use common::{
+    Dag,
+    JobInfo,
     TaskAssignmentRequest,
     TaskAssignmentResponse,
     TaskCompleteRequest,
@@ -125,71 +127,65 @@ pub async fn run() -> Result<()> {
                 let output_path = task.output_path.clone();
                 let num_partitions = task.parallelism.max(1);
 
-                // Ejecutar el WordCount "Spark-like" en un hilo de bloqueo
-                let handle = tokio::task::spawn_blocking(move || {
-                    let path = Path::new(&input_path);
-                    let ext = path
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_lowercase();
+                // 1) Pedir JobInfo al master para obtener el DAG
+                let dag_result: Result<Dag, ()> = async {
+                    let job_url = format!("{}/api/v1/jobs/{}", base_url_cloned, task.job_id);
+                    let resp = client_cloned.get(&job_url).send().await.map_err(|e| {
+                        warn!("error HTTP al pedir job {}: {:?}", task.job_id, e);
+                    })?;
 
-                    // Por ahora asumimos que el campo de texto en CSV/JSON se llama "text"
-                    let text_field = "text";
+                    if !resp.status().is_success() {
+                        warn!(
+                            "master devolvió status {} al pedir job {}",
+                            resp.status(),
+                            task.job_id
+                        );
+                        return Err(());
+                    }
 
-                    match ext.as_str() {
-                        // Archivos de texto plano (.txt): lo que ya tenías
-                        "txt" => engine::wordcount_file_shuffled_local(
+                    let job: JobInfo = resp.json().await.map_err(|e| {
+                        warn!(
+                            "error parseando JobInfo para job {}: {:?}",
+                            task.job_id, e
+                        );
+                    })?;
+
+                    Ok(job.dag)
+                }
+                .await;
+
+                let success = if let Ok(dag) = dag_result {
+                    // 2) Ejecutar el WordCount según el DAG en un hilo de bloqueo
+                    let handle = tokio::task::spawn_blocking(move || {
+                        engine::execute_wordcount_dag_for_file(
+                            &dag,
                             &input_path,
                             &tmp_dir,
                             num_partitions,
                             &output_path,
-                        ),
+                        )
+                    });
 
-                        // CSV con una columna llamada "text"
-                        "csv" => engine::wordcount_csv_file_shuffled_local(
-                            &input_path,
-                            text_field,
-                            &tmp_dir,
-                            num_partitions,
-                            &output_path,
-                        ),
-
-                        // JSONL/JSON: una línea por objeto, con un campo "text"
-                        "jsonl" | "json" => engine::wordcount_jsonl_file_shuffled_local(
-                            &input_path,
-                            text_field,
-                            &tmp_dir,
-                            num_partitions,
-                            &output_path,
-                        ),
-
-                        // Cualquier otra cosa la tratamos como texto plano por defecto
-                        _ => engine::wordcount_file_shuffled_local(
-                            &input_path,
-                            &tmp_dir,
-                            num_partitions,
-                            &output_path,
-                        ),
+                    match handle.await {
+                        Ok(Ok(())) => {
+                            info!("terminé tarea {} correctamente", task.id);
+                            true
+                        }
+                        Ok(Err(e)) => {
+                            warn!("error procesando tarea {}: {:?}", task.id, e);
+                            false
+                        }
+                        Err(e) => {
+                            warn!("panic o join error en tarea {}: {:?}", task.id, e);
+                            false
+                        }
                     }
-                });
-
-                let success = match handle.await {
-                    Ok(Ok(())) => {
-                        info!("terminé tarea {} correctamente", task.id);
-                        true
-                    }
-                    Ok(Err(e)) => {
-                        warn!("error procesando tarea {}: {:?}", task.id, e);
-                        false
-                    }
-                    Err(e) => {
-                        warn!("panic o join error en tarea {}: {:?}", task.id, e);
-                        false
-                    }
+                } else {
+                    // No pudimos obtener el DAG / JobInfo → consideramos la tarea fallida
+                    false
                 };
 
-                // Reportar al master que terminamos
+                // 3) Reportar al master que terminamos
                 let complete_url = format!("{}/api/v1/tasks/complete", base_url_cloned);
                 let _ = client_cloned
                     .post(&complete_url)
@@ -200,9 +196,10 @@ pub async fn run() -> Result<()> {
                     .send()
                     .await;
 
-                // Liberar el "slot" de concurrencia al terminar
+                // 4) Liberar el "slot" de concurrencia al terminar
                 drop(permit);
             });
+
         } else {
             // No hay tarea: devolvemos el permiso y dormimos
             drop(permit);
