@@ -7,6 +7,7 @@ pub type WorkerId = String;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRegisterRequest {
     pub hostname: String,
+    pub max_concurrency: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

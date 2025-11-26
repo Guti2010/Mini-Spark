@@ -22,5 +22,4 @@ pub use worker::{
 };
 pub use results::JobResults;
 
-// Re-export del motor de datos
 pub use engine::{Record, Records, Partition};

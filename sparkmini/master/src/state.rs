@@ -33,6 +33,8 @@ pub struct WorkerMeta {
     pub hostname: String,
     pub last_heartbeat: SystemTime,
     pub dead: bool,
+    /// Capacidad máxima de tareas concurrentes que este worker puede ejecutar.
+    pub max_concurrency: u32,
 }
 
 #[derive(Debug, Clone)]

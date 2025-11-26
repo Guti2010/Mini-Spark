@@ -17,6 +17,8 @@ use tracing_subscriber;
 
 use common::engine;
 
+const DEFAULT_WORKER_CONCURRENCY: u32 = 2;
+
 /// Loop principal del worker.
 /// - Se registra en el master.
 /// - Hace heartbeats periódicos.
@@ -34,20 +36,24 @@ pub async fn run() -> Result<()> {
         .to_string_lossy()
         .to_string();
 
-    // Registro de worker
+    let max_concurrency: u32 = env::var("WORKER_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_WORKER_CONCURRENCY);
+
+    let concurrency: usize = max_concurrency as usize;
+
+    // Registro de worker (ahora enviando max_concurrency)
     let register_url = format!("{}/api/v1/workers/register", base_url);
     let res = client
         .post(&register_url)
-        .json(&WorkerRegisterRequest { hostname })
+        .json(&WorkerRegisterRequest {
+            hostname,
+            max_concurrency,
+        })
         .send()
         .await?;
     let WorkerRegisterResponse { worker_id } = res.json().await?;
-
-    // Concurrencia del worker (cuántas tareas procesa en paralelo)
-    let concurrency: usize = env::var("WORKER_CONCURRENCY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2);
 
     info!(
         "worker {} registrado con concurrency={} contra {}",

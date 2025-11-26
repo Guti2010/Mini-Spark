@@ -14,6 +14,7 @@ use glob::glob;
 use std::fs;
 use tracing::info;
 use chrono::Utc;
+use std::time::SystemTime;
 
 use crate::state::{AppState, InFlight, WorkerMeta};
 use crate::MAX_TASK_ATTEMPTS;
@@ -202,13 +203,18 @@ async fn register_worker(
                 hostname: req.hostname,
                 last_heartbeat: std::time::SystemTime::now(),
                 dead: false,
+                max_concurrency: req.max_concurrency, // 👈 importante
             },
         );
     }
 
-    info!("worker registrado: {}", worker_id);
+    info!(
+        "worker registrado: {} (max_concurrency={})",
+        worker_id, req.max_concurrency
+    );
     Json(WorkerRegisterResponse { worker_id })
 }
+
 
 // Heartbeat de worker
 async fn worker_heartbeat(
@@ -229,16 +235,50 @@ async fn assign_task(
     State(state): State<AppState>,
     Json(req): Json<TaskAssignmentRequest>,
 ) -> Json<TaskAssignmentResponse> {
-    let mut queue = state.tasks_queue.lock().unwrap();
-    let task_opt = queue.pop_front();
-    drop(queue);
+    // 1) Ver cuántas tareas en vuelo tiene este worker
+    let active_for_worker: usize = {
+        let in_flight = state.in_flight.lock().unwrap();
+        in_flight
+            .values()
+            .filter(|inf| inf.worker_id == req.worker_id)
+            .count()
+    };
 
-        if let Some(ref t) = task_opt {
+    // 2) Ver capacidad máxima de este worker
+    let max_for_worker: u32 = {
+        let workers = state.workers.lock().unwrap();
+        workers
+            .get(&req.worker_id)
+            .map(|m| m.max_concurrency)
+            .unwrap_or(1) // por si acaso, default 1
+    };
+
+    if active_for_worker as u32 >= max_for_worker {
         info!(
-            "asignando tarea {} (input={} output={}) al worker {}",
-            t.id, t.input_path, t.output_path, req.worker_id
+            "worker {} pidió tarea pero ya tiene {}/{} en vuelo",
+            req.worker_id, active_for_worker, max_for_worker
+        );
+        return Json(TaskAssignmentResponse { task: None });
+    }
+
+    // 3) Hay capacidad  sacar siguiente tarea de la cola
+    let task_opt = {
+        let mut queue = state.tasks_queue.lock().unwrap();
+        queue.pop_front()
+    };
+
+    if let Some(ref t) = task_opt {
+        info!(
+            "asignando tarea {} (input={} output={}) al worker {} ({}/{} en vuelo -> ahora +1)",
+            t.id,
+            t.input_path,
+            t.output_path,
+            req.worker_id,
+            active_for_worker,
+            max_for_worker
         );
 
+        // 4) Ponerla en in_flight
         {
             let mut in_flight = state.in_flight.lock().unwrap();
             in_flight.insert(
@@ -246,24 +286,26 @@ async fn assign_task(
                 InFlight {
                     task: t.clone(),
                     worker_id: req.worker_id.clone(),
-                    started_at: std::time::SystemTime::now(),
+                    started_at: SystemTime::now(),
                 },
             );
         }
 
+        // 5) Marcar job como RUNNING si no lo estaba
         {
             let mut jobs = state.jobs.lock().unwrap();
             if let Some(job) = jobs.get_mut(&t.job_id) {
                 if matches!(job.status, JobStatus::Accepted) {
                     job.status = JobStatus::Running;
-                    job.started_at = Some(Utc::now().to_rfc3339());
                 }
             }
         }
     } else {
-        info!("worker {} pidió tarea pero no hay", req.worker_id);
+        info!(
+            "worker {} pidió tarea pero no hay tareas en cola",
+            req.worker_id
+        );
     }
-
 
     Json(TaskAssignmentResponse { task: task_opt })
 }
