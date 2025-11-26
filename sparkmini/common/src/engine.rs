@@ -290,3 +290,61 @@ pub fn wordcount_file_shuffled_local(
     // 4) Reduce: sum(count) por token en todas las particiones
     reduce_partitions_to_file(&partitions, "token", "count", output_path)
 }
+
+
+// en common::engine
+
+pub fn read_csv_to_records(path: &str) -> io::Result<Records> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut out = Vec::new();
+
+    // asumiendo primera línea = encabezados
+    let mut lines = reader.lines();
+
+    let header_line = match lines.next() {
+        Some(l) => l?,
+        None => return Ok(out),
+    };
+
+    let headers: Vec<String> = header_line
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+
+    for line_res in lines {
+        let line = line_res?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let cols: Vec<&str> = line.split(',').collect();
+        let mut obj = serde_json::Map::new();
+
+        for (idx, h) in headers.iter().enumerate() {
+            let val = cols.get(idx).unwrap_or(&"").trim();
+            obj.insert(h.clone(), json!(val));
+        }
+
+        out.push(Value::Object(obj));
+    }
+
+    Ok(out)
+}
+
+pub fn read_jsonl_to_records(path: &str) -> io::Result<Records> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut out = Vec::new();
+
+    for line_res in reader.lines() {
+        let line = line_res?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let rec: Value = serde_json::from_str(&line)?;
+        out.push(rec);
+    }
+
+    Ok(out)
+}

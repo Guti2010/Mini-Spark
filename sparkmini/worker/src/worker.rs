@@ -7,6 +7,7 @@ use common::{
     WorkerRegisterRequest,
     WorkerRegisterResponse,
 };
+use common::engine; 
 use hostname;
 use reqwest::Client;
 use std::{env, sync::Arc, time::Duration};
@@ -15,7 +16,6 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 use tracing_subscriber;
 
-use common::engine;
 
 /// Loop principal del worker.
 /// - Se registra en el master.
