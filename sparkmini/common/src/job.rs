@@ -54,4 +54,5 @@ pub struct JobInfo {
     pub total_tasks: u32,
     pub completed_tasks: u32,
     pub failed_tasks: u32,
+    pub retries: u32,
 }

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 common = { path = "../common" }
+sysinfo = { version = "0.29", features = ["multithread"] }
 
 # Para hacer requests HTTP y async más adelante
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }

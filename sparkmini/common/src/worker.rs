@@ -18,6 +18,8 @@ pub struct WorkerRegisterResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerHeartbeatRequest {
     pub worker_id: WorkerId,
+    pub cpu_percent: f32,
+    pub mem_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,5 +60,8 @@ pub struct WorkerMetrics {
     pub tasks_succeeded: u64,
     pub tasks_failed: u64,
     pub avg_task_ms: Option<f64>,
+
+    pub cpu_percent: Option<f32>,
+    pub mem_bytes: Option<u64>,
 }
 

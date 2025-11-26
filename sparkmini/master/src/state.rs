@@ -40,6 +40,9 @@ pub struct WorkerMeta {
     pub tasks_succeeded: u64,
     pub tasks_failed: u64,
     pub total_task_time_ms: u64,
+
+    pub last_cpu_percent: Option<f32>,
+    pub last_mem_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

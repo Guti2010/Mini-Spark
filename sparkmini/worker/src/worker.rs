@@ -16,6 +16,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 use tracing_subscriber;
 use std::path::Path;
+use sysinfo::{System, SystemExt, CpuExt};
 
 
 const DEFAULT_WORKER_CONCURRENCY: u32 = 2;
@@ -44,7 +45,7 @@ pub async fn run() -> Result<()> {
 
     let concurrency: usize = max_concurrency as usize;
 
-    // Registro de worker (ahora enviando max_concurrency)
+    // Registro de worker (enviando max_concurrency)
     let register_url = format!("{}/api/v1/workers/register", base_url);
     let res = client
         .post(&register_url)
@@ -63,18 +64,30 @@ pub async fn run() -> Result<()> {
 
     let sem = Arc::new(Semaphore::new(concurrency));
 
+    // System para leer CPU y memoria
+    let mut sys = System::new_all();
+
     loop {
-        // Heartbeat al master
+        // --------- Heartbeat al master con CPU/MEM ---------
+        sys.refresh_cpu();
+        sys.refresh_memory();
+
+        let cpu_percent = sys.global_cpu_info().cpu_usage();
+        // used_memory devuelve KB -> lo pasamos a bytes
+        let mem_bytes = sys.used_memory() * 1024;
+
         let hb_url = format!("{}/api/v1/workers/heartbeat", base_url);
         let _ = client
             .post(&hb_url)
             .json(&WorkerHeartbeatRequest {
                 worker_id: worker_id.clone(),
+                cpu_percent,
+                mem_bytes,
             })
             .send()
             .await;
 
-        // Intentar reservar un "slot" de concurrencia
+        // --------- Control de concurrencia local ---------
         let permit = match sem.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
@@ -106,7 +119,6 @@ pub async fn run() -> Result<()> {
             let client_cloned = client.clone();
             let base_url_cloned = base_url.clone();
 
-            // Lanzamos la ejecución de la tarea en paralelo
             tokio::spawn(async move {
                 let tmp_dir = "/data/tmp".to_string();
                 let input_path = task.input_path.clone();
@@ -116,7 +128,11 @@ pub async fn run() -> Result<()> {
                 // Ejecutar el WordCount "Spark-like" en un hilo de bloqueo
                 let handle = tokio::task::spawn_blocking(move || {
                     let path = Path::new(&input_path);
-                    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                    let ext = path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
 
                     // Por ahora asumimos que el campo de texto en CSV/JSON se llama "text"
                     let text_field = "text";
@@ -195,3 +211,4 @@ pub async fn run() -> Result<()> {
         }
     }
 }
+

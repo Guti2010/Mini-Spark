@@ -107,6 +107,7 @@ async fn create_job(
         total_tasks,
         completed_tasks: 0,
         failed_tasks: 0,
+        retries: 0,
     };
 
     {
@@ -198,6 +199,9 @@ async fn register_worker(
                 tasks_succeeded: 0,
                 tasks_failed: 0,
                 total_task_time_ms: 0,
+
+                last_cpu_percent: None,
+                last_mem_bytes: None,
             },
         );
     }
@@ -218,7 +222,9 @@ async fn worker_heartbeat(
 ) -> Result<Json<WorkerHeartbeatResponse>, StatusCode> {
     let mut workers = state.workers.lock().unwrap();
     if let Some(meta) = workers.get_mut(&req.worker_id) {
-        meta.last_heartbeat = std::time::SystemTime::now();
+        meta.last_heartbeat = SystemTime::now();
+        meta.last_cpu_percent = Some(req.cpu_percent);
+        meta.last_mem_bytes = Some(req.mem_bytes);
         Ok(Json(WorkerHeartbeatResponse { ok: true }))
     } else {
         Err(StatusCode::NOT_FOUND)
@@ -355,11 +361,21 @@ async fn complete_task(
 
         // ---- Caso fallo: reintentos o marcar job como Failed ----
         if !req.success {
+        // 1) Contabilizar reintento a nivel de job
+            {
+                let mut jobs = state.jobs.lock().unwrap();
+                if let Some(job) = jobs.get_mut(&job_id) {
+                    job.retries += 1;
+                }
+            }
+        
+            // 2) Reintentar si no superamos MAX_TASK_ATTEMPTS
             if task.attempt + 1 <= MAX_TASK_ATTEMPTS {
                 task.attempt += 1;
                 let mut queue = state.tasks_queue.lock().unwrap();
                 queue.push_back(task);
             } else {
+                // 3) Se agotaron reintentos -> marcar job como Failed
                 let mut jobs = state.jobs.lock().unwrap();
                 if let Some(job) = jobs.get_mut(&job_id) {
                     job.failed_tasks += 1;
@@ -367,6 +383,7 @@ async fn complete_task(
                     job.finished_at = Some(Utc::now());
                 }
             }
+        
             return Ok(Json(TaskCompleteResponse { ok: true }));
         }
 
@@ -445,6 +462,8 @@ async fn list_workers(State(state): State<AppState>) -> Json<Vec<WorkerMetrics>>
             tasks_succeeded: meta.tasks_succeeded,
             tasks_failed: meta.tasks_failed,
             avg_task_ms: avg_ms,
+            cpu_percent: meta.last_cpu_percent,
+            mem_bytes: meta.last_mem_bytes,
         });
     }
 

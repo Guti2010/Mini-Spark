@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use common::{Dag, DagNode, JobInfo, JobRequest, JobResults};
+use common::{Dag, DagNode, JobInfo, JobRequest, JobResults, WorkerMetrics};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::env;
@@ -37,6 +37,8 @@ enum Commands {
         #[arg(value_name = "JOB_ID")]
         id: String,
     },
+
+    Workers,
 }
 
 /// Construye un DAG fijo de WordCount:
@@ -141,8 +143,8 @@ pub async fn run() -> Result<()> {
 
                 // métricas de tareas
                 println!(
-                    "  tareas: total={}, completadas={}, fallidas={}",
-                    job.total_tasks, job.completed_tasks, job.failed_tasks
+                    "  tareas: total={}, completadas={}, fallidas={}, reintentos={}",
+                    job.total_tasks, job.completed_tasks, job.failed_tasks, job.retries
                 );
 
                 // progreso calculado localmente
@@ -188,6 +190,57 @@ pub async fn run() -> Result<()> {
                 println!("No se encontraron resultados para job {id}");
             }
         }
+
+        Commands::Workers => {
+            let url = format!("{}/api/v1/workers", base_url);
+            let resp = client.get(&url).send().await?;
+            if resp.status().is_success() {
+                let workers: Vec<WorkerMetrics> = resp.json().await?;
+                if workers.is_empty() {
+                    println!("No hay workers registrados.");
+                } else {
+                    for w in workers {
+                        println!("Worker {}", w.worker_id);
+                        println!("  host           : {}", w.hostname);
+                        println!("  dead           : {}", w.dead);
+                        println!(
+                            "  last_heartbeat : {} s ago",
+                            w.last_heartbeat_secs_ago
+                        );
+                        println!(
+                            "  concurrency    : max={}",
+                            w.max_concurrency
+                        );
+                        println!(
+                            "  tareas         : started={}, ok={}, failed={}",
+                            w.tasks_started, w.tasks_succeeded, w.tasks_failed
+                        );
+                        if let Some(avg) = w.avg_task_ms {
+                            println!("  avg_task_ms    : {:.1}", avg);
+                        } else {
+                            println!("  avg_task_ms    : (sin datos)");
+                        }
+                        if let Some(cpu) = w.cpu_percent {
+                            println!("  cpu_percent    : {:.1}%", cpu);
+                        } else {
+                            println!("  cpu_percent    : (sin datos)");
+                        }
+                        if let Some(mem) = w.mem_bytes {
+                            println!("  mem_bytes      : {}", mem);
+                        } else {
+                            println!("  mem_bytes      : (sin datos)");
+                        }
+                        println!();
+                    }
+                }
+            } else {
+                println!(
+                    "Error consultando /api/v1/workers (status {})",
+                    resp.status()
+                );
+            }
+        }
+
     }
 
     Ok(())
