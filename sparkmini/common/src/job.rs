@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Utc};
 
 use crate::dag::Dag;
 
@@ -47,22 +48,10 @@ pub struct JobInfo {
     pub output_dir: String,
 
     /// -------- Métricas del job --------
-    /// Número total de tareas creadas para este job
+    pub submitted_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
     pub total_tasks: u32,
-
-    /// Tareas que han terminado con éxito
     pub completed_tasks: u32,
-
-    /// Tareas que terminaron definitivamente en fallo (sin más reintentos)
     pub failed_tasks: u32,
-
-    /// Cantidad de reintentos totales en todas las tareas
-    pub retries: u32,
-
-    /// Progreso aproximado en porcentaje [0, 100]
-    pub progress_pct: f32,
-
-    /// Tiempos (en formato RFC3339, opcionales)
-    pub started_at: Option<String>,
-    pub finished_at: Option<String>,
 }

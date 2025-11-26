@@ -42,10 +42,10 @@ enum Commands {
 /// Construye un DAG fijo de WordCount:
 /// read_text -> flat_map(tokenize) -> map(to_lower) -> reduce_by_key(sum)
 ///
-/// Devuelve: (dag, input_glob, output_dir)
-fn build_wordcount_dag() -> (Dag, String, String) {
-    let input_glob = "/data/input/*".to_string();
-    let output_dir = "/data/output".to_string();
+/// Devuelve: (dag, input_glob)
+fn build_wordcount_dag() -> (Dag, String) {
+    // patrón de entrada que el master va a usar para crear tareas
+    let input_glob = "/data/input/*.txt".to_string();
 
     // Nodo "read": lee texto desde input_glob
     let mut read_params = HashMap::new();
@@ -92,9 +92,8 @@ fn build_wordcount_dag() -> (Dag, String, String) {
         ],
     };
 
-    (dag, input_glob, output_dir)
+    (dag, input_glob)
 }
-
 
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -105,15 +104,16 @@ pub async fn run() -> Result<()> {
         Commands::Submit { name } => {
             let url = format!("{}/api/v1/jobs", base_url);
 
-            // Construimos el DAG fijo de WordCount y los paths de entrada/salida
-            let (dag, input_glob, output_dir) = build_wordcount_dag();
+            // Construimos el DAG fijo de WordCount y el patrón de entrada
+            let (dag, input_glob) = build_wordcount_dag();
 
+            // OJO: JobRequest en common solo tiene estos campos ahora
             let req = JobRequest {
                 name,
                 dag,
-                parallelism: 4, // por ahora fijo; luego lo hacemos parámetro
+                parallelism: 4, 
                 input_glob,
-                output_dir,
+                output_dir: "/data/output".to_string(),
             };
 
             let resp = client.post(&url).json(&req).send().await?;
@@ -126,8 +126,8 @@ pub async fn run() -> Result<()> {
             println!("  parallelism: {}", job_info.parallelism);
             println!("  input_glob: {}", job_info.input_glob);
             println!("  output_dir: {}", job_info.output_dir);
+            println!("  submitted_at: {}", job_info.submitted_at);
         }
-
 
         Commands::Status { id } => {
             let url = format!("{}/api/v1/jobs/{}", base_url, id);
@@ -138,13 +138,25 @@ pub async fn run() -> Result<()> {
                 println!("  id: {}", job.id);
                 println!("  nombre: {}", job.name);
                 println!("  estado: {:?}", job.status);
-                println!("  progreso: {:.1}%", job.progress_pct);
+
+                // métricas de tareas
                 println!(
-                    "  tareas: {}/{} completadas, {} fallidas, {} reintentos",
-                    job.completed_tasks, job.total_tasks, job.failed_tasks, job.retries
+                    "  tareas: total={}, completadas={}, fallidas={}",
+                    job.total_tasks, job.completed_tasks, job.failed_tasks
                 );
+
+                // progreso calculado localmente
+                let done = job.completed_tasks + job.failed_tasks;
+                if job.total_tasks > 0 {
+                    let pct = (done as f64 / job.total_tasks as f64) * 100.0;
+                    println!("  progreso: {:.1}%", pct);
+                } else {
+                    println!("  progreso: (sin tareas)");
+                }
+
                 println!("  input_glob: {}", job.input_glob);
                 println!("  output_dir: {}", job.output_dir);
+                println!("  submitted_at: {}", job.submitted_at);
                 if let Some(ref started) = job.started_at {
                     println!("  iniciado: {}", started);
                 }
@@ -155,7 +167,6 @@ pub async fn run() -> Result<()> {
                 println!("Error: job no encontrado (status {})", resp.status());
             }
         }
-
 
         Commands::Results { id } => {
             let url = format!("{}/api/v1/jobs/{id}/results", base_url);

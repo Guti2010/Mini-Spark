@@ -19,6 +19,7 @@ pub use worker::{
     TaskAssignmentResponse,
     TaskCompleteRequest,
     TaskCompleteResponse,
+    WorkerMetrics,
 };
 pub use results::JobResults;
 
