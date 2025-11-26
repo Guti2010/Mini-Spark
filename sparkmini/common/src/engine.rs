@@ -1,11 +1,10 @@
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, HashMap},
     fs::{self, File},
     hash::{Hash, Hasher},
     io::{self, BufRead, BufReader, BufWriter, Write},
     path::Path,
-    collections::hash_map::DefaultHasher,
 };
 
 /// Tipo genérico de registro (fila de datos).
@@ -63,11 +62,7 @@ where
 ///   - Agrupa por el campo `key_field` (ej: "token").
 ///   - Suma el campo numérico `value_field` (ej: "count").
 ///   - Devuelve registros de la forma `{ key_field: <clave>, value_field: <suma> }`.
-pub fn op_reduce_by_key(
-    input: Records,
-    key_field: &str,
-    value_field: &str,
-) -> Records {
+pub fn op_reduce_by_key(input: Records, key_field: &str, value_field: &str) -> Records {
     let mut acc: HashMap<String, u64> = HashMap::new();
 
     for rec in input.into_iter() {
@@ -89,6 +84,133 @@ pub fn op_reduce_by_key(
             })
         })
         .collect()
+}
+
+/* ---------------- JOIN en memoria ---------------- */
+
+/// Fusiona dos registros JSON en uno solo.
+/// - el campo `key_field` se mantiene una sola vez
+/// - si un campo existe en ambos lados, se respeta el del lado izquierdo
+///   y el del derecho se guarda con prefijo `right_`.
+fn merge_records(left: &Record, right: &Record, key_field: &str) -> Record {
+    let mut obj = serde_json::Map::new();
+
+    if let Some(lobj) = left.as_object() {
+        for (k, v) in lobj {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+
+    if let Some(robj) = right.as_object() {
+        for (k, v) in robj {
+            if k == key_field {
+                // ya existe desde el lado izquierdo; lo dejamos tal cual
+                continue;
+            }
+            if obj.contains_key(k) {
+                let new_key = format!("right_{}", k);
+                obj.insert(new_key, v.clone());
+            } else {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    Value::Object(obj)
+}
+
+/// Inner join en memoria entre dos colecciones por el campo `key_field`.
+/// Si hay N registros a la izquierda y M a la derecha con la misma clave,
+/// se generan N*M registros combinados.
+pub fn op_join_by_key(left: Records, right: Records, key_field: &str) -> Records {
+    // indexamos el lado derecho por clave
+    let mut index: HashMap<String, Vec<Record>> = HashMap::new();
+
+    for rec in right.into_iter() {
+        if let Some(obj) = rec.as_object() {
+            if let Some(k) = obj.get(key_field).and_then(|v| v.as_str()) {
+                index.entry(k.to_string()).or_default().push(rec);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+
+    for lrec in left.into_iter() {
+        let key_opt = lrec
+            .get(key_field)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let Some(key) = key_opt else {
+            continue;
+        };
+
+        if let Some(r_matches) = index.get(&key) {
+            for rrec in r_matches {
+                out.push(merge_records(&lrec, rrec, key_field));
+            }
+        }
+    }
+
+    out
+}
+
+/* ---------------- Lectura de archivos a Records ---------------- */
+
+pub fn read_csv_to_records(path: &str) -> io::Result<Records> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut out = Vec::new();
+
+    // asumiendo primera línea = encabezados
+    let mut lines = reader.lines();
+
+    let header_line = match lines.next() {
+        Some(l) => l?,
+        None => return Ok(out),
+    };
+
+    let headers: Vec<String> = header_line
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+
+    for line_res in lines {
+        let line = line_res?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let cols: Vec<&str> = line.split(',').collect();
+        let mut obj = serde_json::Map::new();
+
+        for (idx, h) in headers.iter().enumerate() {
+            let val = cols.get(idx).unwrap_or(&"").trim();
+            obj.insert(h.clone(), json!(val));
+        }
+
+        out.push(Value::Object(obj));
+    }
+
+    Ok(out)
+}
+
+pub fn read_jsonl_to_records(path: &str) -> io::Result<Records> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut out = Vec::new();
+
+    for line_res in reader.lines() {
+        let line = line_res?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let rec: Value = serde_json::from_str(&line)?;
+        out.push(rec);
+    }
+
+    Ok(out)
 }
 
 /* ---------------- WordCount en memoria (una sola etapa) ---------------- */
@@ -133,6 +255,92 @@ where
     let recs = wc_stage1_make_token_records(lines);
     op_reduce_by_key(recs, "token", "count")
 }
+
+/// Etapa 1 de WordCount desde registros:
+///   records con campo `text_field` -> registros { "token": <palabra>, "count": 1 }
+fn wc_stage1_from_records(input: Records, text_field: &str) -> Records {
+    let mut recs: Records = Vec::new();
+
+    for rec in input.into_iter() {
+        if let Some(obj) = rec.as_object() {
+            if let Some(text) = obj.get(text_field).and_then(|v| v.as_str()) {
+                for raw in text.split_whitespace() {
+                    let cleaned: String = raw
+                        .chars()
+                        .filter(|c| c.is_alphanumeric() || *c == '_')
+                        .collect::<String>()
+                        .to_lowercase();
+
+                    if !cleaned.is_empty() {
+                        recs.push(json!({
+                            "token": cleaned,
+                            "count": 1_u64,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    recs
+}
+
+/// WordCount para un archivo CSV.
+/// Se asume que el CSV tiene una columna `text_field` con el texto a tokenizar.
+pub fn wordcount_csv_file_shuffled_local(
+    input_path: &str,
+    text_field: &str,
+    tmp_dir: &str,
+    num_partitions: u32,
+    output_path: &str,
+) -> io::Result<()> {
+    // 1) Leer registros desde CSV
+    let recs = read_csv_to_records(input_path)?;
+
+    // 2) Stage1: records -> tokens {token,count=1}
+    let token_records = wc_stage1_from_records(recs, text_field);
+
+    // 3) Shuffle: token -> particiones por hash(token)
+    let partitions = shuffle_to_partitions(
+        token_records,
+        "token",
+        num_partitions,
+        tmp_dir,
+        "wc_stage1_csv",
+    )?;
+
+    // 4) Reduce: sum(count) por token en todas las particiones
+    reduce_partitions_to_file(&partitions, "token", "count", output_path)
+}
+
+/// WordCount para un archivo JSONL.
+/// Se asume que cada línea es un objeto JSON con un campo `text_field` con el texto.
+pub fn wordcount_jsonl_file_shuffled_local(
+    input_path: &str,
+    text_field: &str,
+    tmp_dir: &str,
+    num_partitions: u32,
+    output_path: &str,
+) -> io::Result<()> {
+    // 1) Leer registros desde JSONL
+    let recs = read_jsonl_to_records(input_path)?;
+
+    // 2) Stage1: records -> tokens {token,count=1}
+    let token_records = wc_stage1_from_records(recs, text_field);
+
+    // 3) Shuffle: token -> particiones por hash(token)
+    let partitions = shuffle_to_partitions(
+        token_records,
+        "token",
+        num_partitions,
+        tmp_dir,
+        "wc_stage1_jsonl",
+    )?;
+
+    // 4) Reduce: sum(count) por token en todas las particiones
+    reduce_partitions_to_file(&partitions, "token", "count", output_path)
+}
+
 
 /* ---------------- shuffle a particiones en disco ---------------- */
 
@@ -279,72 +487,57 @@ pub fn wordcount_file_shuffled_local(
     let token_records = wc_stage1_make_token_records(lines);
 
     // 3) Shuffle: token -> particiones por hash(token)
-    let partitions = shuffle_to_partitions(
-        token_records,
-        "token",
-        num_partitions,
-        tmp_dir,
-        "wc_stage1",
-    )?;
+    let partitions = shuffle_to_partitions(token_records, "token", num_partitions, tmp_dir, "wc_stage1")?;
 
     // 4) Reduce: sum(count) por token en todas las particiones
     reduce_partitions_to_file(&partitions, "token", "count", output_path)
 }
 
+/* ---------------- JOIN sobre particiones en disco ---------------- */
 
-// en common::engine
-
-pub fn read_csv_to_records(path: &str) -> io::Result<Records> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut out = Vec::new();
-
-    // asumiendo primera línea = encabezados
-    let mut lines = reader.lines();
-
-    let header_line = match lines.next() {
-        Some(l) => l?,
-        None => return Ok(out),
-    };
-
-    let headers: Vec<String> = header_line
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .collect();
-
-    for line_res in lines {
-        let line = line_res?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let cols: Vec<&str> = line.split(',').collect();
-        let mut obj = serde_json::Map::new();
-
-        for (idx, h) in headers.iter().enumerate() {
-            let val = cols.get(idx).unwrap_or(&"").trim();
-            obj.insert(h.clone(), json!(val));
-        }
-
-        out.push(Value::Object(obj));
+/// Inner join entre dos conjuntos de particiones ya "shuffeadas" por la misma clave.
+/// - `left_parts` y `right_parts` deben venir de `shuffle_to_partitions`
+///   usando el mismo `key_field` y el mismo `num_partitions`.
+/// - Escribe el resultado en un archivo JSONL en `output_path`.
+pub fn join_partitions_to_jsonl(
+    left_parts: &[Partition],
+    right_parts: &[Partition],
+    key_field: &str,
+    output_path: &str,
+) -> io::Result<()> {
+    // indexamos las particiones de la derecha por id
+    let mut right_by_id: HashMap<u32, &Partition> = HashMap::new();
+    for p in right_parts {
+        right_by_id.insert(p.id, p);
     }
 
-    Ok(out)
-}
-
-pub fn read_jsonl_to_records(path: &str) -> io::Result<Records> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut out = Vec::new();
-
-    for line_res in reader.lines() {
-        let line = line_res?;
-        if line.trim().is_empty() {
-            continue;
+    // Crear carpeta de salida si hace falta
+    if let Some(parent) = Path::new(output_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
         }
-        let rec: Value = serde_json::from_str(&line)?;
-        out.push(rec);
     }
 
-    Ok(out)
+    let out = File::create(output_path)?;
+    let mut writer = BufWriter::new(out);
+
+    // Para cada partición izquierda, buscamos la correspondiente derecha
+    for lpart in left_parts {
+        if let Some(rpart) = right_by_id.get(&lpart.id) {
+            let lrecs = read_partition(&lpart.path)?;
+            let rrecs = read_partition(&rpart.path)?;
+
+            // join en memoria para esta partición
+            let joined = op_join_by_key(lrecs, rrecs, key_field);
+
+            // escribimos los registros como JSONL
+            for rec in joined {
+                serde_json::to_writer(&mut writer, &rec)?;
+                writer.write_all(b"\n")?;
+            }
+        }
+    }
+
+    writer.flush()?;
+    Ok(())
 }
