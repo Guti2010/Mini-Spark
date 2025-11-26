@@ -1,3 +1,0 @@
-distribuidor,1
-hola,1
-rust,3

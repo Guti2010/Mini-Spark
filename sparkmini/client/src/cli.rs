@@ -44,7 +44,7 @@ enum Commands {
 ///
 /// Devuelve: (dag, input_glob, output_dir)
 fn build_wordcount_dag() -> (Dag, String, String) {
-    let input_glob = "/data/input/*.txt".to_string();
+    let input_glob = "/data/input/*".to_string();
     let output_dir = "/data/output".to_string();
 
     // Nodo "read": lee texto desde input_glob

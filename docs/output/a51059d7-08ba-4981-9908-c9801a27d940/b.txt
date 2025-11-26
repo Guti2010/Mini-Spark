@@ -1,5 +1,0 @@
-distribuidor,1
-hola,1
-mundo,2
-prueba,1
-rust,3

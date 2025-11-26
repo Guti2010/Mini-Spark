@@ -7,6 +7,7 @@ use common::{
     WorkerRegisterRequest,
     WorkerRegisterResponse,
 };
+use common::engine; 
 use hostname;
 use reqwest::Client;
 use std::{env, sync::Arc, time::Duration};
@@ -14,8 +15,8 @@ use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::{info, warn};
 use tracing_subscriber;
+use std::path::Path;
 
-use common::engine;
 
 const DEFAULT_WORKER_CONCURRENCY: u32 = 2;
 
@@ -114,12 +115,47 @@ pub async fn run() -> Result<()> {
 
                 // Ejecutar el WordCount "Spark-like" en un hilo de bloqueo
                 let handle = tokio::task::spawn_blocking(move || {
-                    engine::wordcount_file_shuffled_local(
-                        &input_path,
-                        &tmp_dir,
-                        num_partitions,
-                        &output_path,
-                    )
+                    let path = Path::new(&input_path);
+                    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+
+                    // Por ahora asumimos que el campo de texto en CSV/JSON se llama "text"
+                    let text_field = "text";
+
+                    match ext.as_str() {
+                        // Archivos de texto plano (.txt): lo que ya tenías
+                        "txt" => engine::wordcount_file_shuffled_local(
+                            &input_path,
+                            &tmp_dir,
+                            num_partitions,
+                            &output_path,
+                        ),
+
+                        // CSV con una columna llamada "text"
+                        "csv" => engine::wordcount_csv_file_shuffled_local(
+                            &input_path,
+                            text_field,
+                            &tmp_dir,
+                            num_partitions,
+                            &output_path,
+                        ),
+
+                        // JSONL/JSON: una línea por objeto, con un campo "text"
+                        "jsonl" | "json" => engine::wordcount_jsonl_file_shuffled_local(
+                            &input_path,
+                            text_field,
+                            &tmp_dir,
+                            num_partitions,
+                            &output_path,
+                        ),
+
+                        // Cualquier otra cosa la tratamos como texto plano por defecto
+                        _ => engine::wordcount_file_shuffled_local(
+                            &input_path,
+                            &tmp_dir,
+                            num_partitions,
+                            &output_path,
+                        ),
+                    }
                 });
 
                 let success = match handle.await {
