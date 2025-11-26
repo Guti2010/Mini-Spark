@@ -2,7 +2,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use common::{Dag, DagNode, JobInfo, JobRequest, JobResults, WorkerMetrics};
 use reqwest::Client;
-use std::collections::HashMap;
 use std::env;
 
 /// Igual que en el worker:

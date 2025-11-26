@@ -23,6 +23,129 @@ pub struct Partition {
     pub path: String,
 }
 
+const DEFAULT_MAX_IN_MEM_KEYS: usize = 100_000;
+
+/// Umbral máximo de claves en memoria.
+/// Se puede sobreescribir con la env var MAX_IN_MEM_KEYS.
+fn max_in_mem_keys() -> usize {
+    std::env::var("MAX_IN_MEM_KEYS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_IN_MEM_KEYS)
+}
+
+/// Acumulador clave→valor con spill a disco cuando el mapa crece demasiado.
+struct SpillingAggregator {
+    map: HashMap<String, u64>,
+    spill_files: Vec<String>,
+    dir: String,
+    threshold: usize,
+    spill_counter: usize,
+}
+
+impl SpillingAggregator {
+    fn new(dir: &str, threshold: usize) -> io::Result<Self> {
+        if !dir.is_empty() {
+            fs::create_dir_all(dir)?;
+        }
+        Ok(Self {
+            map: HashMap::new(),
+            spill_files: Vec::new(),
+            dir: dir.to_string(),
+            threshold,
+            spill_counter: 0,
+        })
+    }
+
+    fn add(&mut self, key: &str, value: u64) -> io::Result<()> {
+        *self.map.entry(key.to_string()).or_insert(0) += value;
+        if self.map.len() >= self.threshold {
+            self.spill_one()?;
+        }
+        Ok(())
+    }
+
+    fn spill_one(&mut self) -> io::Result<()> {
+        if self.map.is_empty() || self.dir.is_empty() {
+            return Ok(());
+        }
+
+        self.spill_counter += 1;
+        let filename = format!("spill-{}.jsonl", self.spill_counter);
+        let path = Path::new(&self.dir).join(filename);
+        let mut writer = BufWriter::new(File::create(&path)?);
+
+        for (k, v) in self.map.drain() {
+            let obj = json!({ "k": k, "v": v });
+            serde_json::to_writer(&mut writer, &obj).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("error al escribir spill en {}: {e}", path.display()),
+                )
+            })?;
+            writer.write_all(b"\n")?;
+        }
+
+        writer.flush()?;
+        self.spill_files
+            .push(path.to_string_lossy().to_string());
+        Ok(())
+    }
+
+    fn finalize_to_csv(mut self, output_path: &str) -> io::Result<()> {
+        // Combinar mapa en memoria + spills en un acumulador final.
+        let mut final_acc: HashMap<String, u64> = HashMap::new();
+
+        for (k, v) in self.map.drain() {
+            *final_acc.entry(k).or_insert(0) += v;
+        }
+
+        for spill_path in &self.spill_files {
+            let file = File::open(spill_path)?;
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let v: Value = serde_json::from_str(&line).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("error al parsear spill {}: {e}", spill_path),
+                    )
+                })?;
+                let key = v
+                    .get("k")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let val = v.get("v").and_then(|x| x.as_u64()).unwrap_or(0);
+                *final_acc.entry(key).or_insert(0) += val;
+            }
+        }
+
+        if let Some(parent) = Path::new(output_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let out = File::create(output_path)?;
+        let mut writer = BufWriter::new(out);
+
+        let mut entries: Vec<(String, u64)> = final_acc.into_iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Igual que antes: líneas "token,count"
+        for (key, val) in entries {
+            writeln!(writer, "{},{}", key, val)?;
+        }
+
+        writer.flush()?;
+        Ok(())
+    }
+}
+
 /* =========================
    Operadores genéricos
    ========================= */
@@ -500,14 +623,16 @@ pub fn read_partition(path: &str) -> io::Result<Records> {
 
 /// Reduce todas las particiones (que ya tienen {key_field, value_field})
 /// y escribe el resultado en un archivo CSV simple:
-///   key_field,value_field
+///   key_field,value_field (sin encabezado)
 pub fn reduce_partitions_to_file(
     partitions: &[Partition],
     key_field: &str,
     value_field: &str,
     output_path: &str,
 ) -> io::Result<()> {
-    let mut acc: HashMap<String, u64> = HashMap::new();
+    // Acumulador con spill en /data/tmp/spill_reduce
+    let spill_dir = "/data/tmp/spill_reduce";
+    let mut agg = SpillingAggregator::new(spill_dir, max_in_mem_keys())?;
 
     for part in partitions {
         let recs = read_partition(&part.path)?;
@@ -516,32 +641,16 @@ pub fn reduce_partitions_to_file(
                 let key_opt = obj.get(key_field).and_then(|v| v.as_str());
                 let val_opt = obj.get(value_field).and_then(|v| v.as_u64());
                 if let (Some(k), Some(v)) = (key_opt, val_opt) {
-                    *acc.entry(k.to_string()).or_insert(0) += v;
+                    agg.add(k, v)?;
                 }
             }
         }
     }
 
-    if let Some(parent) = Path::new(output_path).parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-
-    let out = File::create(output_path)?;
-    let mut writer = BufWriter::new(out);
-
-    let mut entries: Vec<(String, u64)> = acc.into_iter().collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-    // Ejemplo CSV: token,count
-    for (key, val) in entries {
-        writeln!(writer, "{},{}", key, val)?;
-    }
-
-    writer.flush()?;
-    Ok(())
+    // Escribir el resultado final a CSV (token,count, o la pareja que toque).
+    agg.finalize_to_csv(output_path)
 }
+
 
 /* =========================
    Demo local: WordCount con shuffle a particiones
