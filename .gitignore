@@ -27,5 +27,6 @@ Thumbs.db
 dump.sql
 *.tmp
 
-docs
+docs/output/
+docs/tmp/
 
