@@ -370,9 +370,12 @@ pub fn read_csv_to_records(path: &str) -> io::Result<Records> {
         None => return Ok(out),
     };
 
+    // 🔧 Limpia BOM por si viene de Excel/Windows
+    let header_line = header_line.trim_start_matches('\u{feff}');
+
     let headers: Vec<String> = header_line
         .split(',')
-        .map(|s| s.trim().to_string())
+        .map(|s| s.trim().trim_start_matches('\u{feff}').to_string())
         .collect();
 
     for line_res in lines {
@@ -385,7 +388,11 @@ pub fn read_csv_to_records(path: &str) -> io::Result<Records> {
         let mut obj = serde_json::Map::new();
 
         for (idx, h) in headers.iter().enumerate() {
-            let val = cols.get(idx).unwrap_or(&"").trim();
+            let mut val = cols.get(idx).unwrap_or(&"").trim();
+
+            // 🔧 Por si algún valor raro viene con BOM
+            val = val.trim_start_matches('\u{feff}');
+
             obj.insert(h.clone(), json!(val));
         }
 
@@ -394,6 +401,7 @@ pub fn read_csv_to_records(path: &str) -> io::Result<Records> {
 
     Ok(out)
 }
+
 
 pub fn read_jsonl_to_records(path: &str) -> io::Result<Records> {
     let file = File::open(path)?;
@@ -834,6 +842,7 @@ pub fn join_csv_in_memory(
     let right = read_csv_to_records(right_path)?;
 
     let joined = op_join_by_key(left, right, key_field);
+    
 
     if let Some(parent) = Path::new(output_path).parent() {
         if !parent.as_os_str().is_empty() {

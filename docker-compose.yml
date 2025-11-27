@@ -51,6 +51,7 @@ services:
       - .:/app
       # <<< NUEVO: comparte el mismo cache
       - cargo-registry:/usr/local/cargo/registry
+      - ./docs:/data
     # -q = quiet, menos ruido de Cargo
     entrypoint: ["cargo", "run", "-q", "-p", "client", "--"]
 

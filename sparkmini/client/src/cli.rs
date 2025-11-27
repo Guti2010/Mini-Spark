@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use common::{Dag, DagNode, JobInfo, JobRequest, JobResults, WorkerMetrics};
 use reqwest::Client;
 use std::env;
-
+use common::engine;
 /// Igual que en el worker:
 /// - En Docker: MASTER_URL=http://master:8080
 /// - Local: default http://localhost:8080
@@ -38,6 +38,25 @@ enum Commands {
     },
 
     Workers,
+
+    /// Demo: join entre dos CSV por clave usando el engine local
+    Join {
+        /// Ruta al CSV de ventas (dentro del contenedor)
+        #[arg(value_name = "VENTAS_CSV")]
+        left: String,
+
+        /// Ruta al CSV de catalogo (dentro del contenedor)
+        #[arg(value_name = "CATALOGO_CSV")]
+        right: String,
+
+        /// Nombre de la columna clave
+        #[arg(long, default_value = "product_id")]
+        key: String,
+
+        /// Ruta de salida JSONL (dentro del contenedor)
+        #[arg(long, default_value = "/data/output/join_ventas_catalogo.jsonl")]
+        output: String,
+    },
 }
 
 /// Construye un DAG fijo de WordCount estilo enunciado:
@@ -193,6 +212,22 @@ pub async fn run() -> Result<()> {
                 println!("No se encontraron resultados para job {id}");
             }
         }
+
+        Commands::Join { left, right, key, output } => {
+            println!("Ejecutando join local entre CSVs:");
+            println!("  left : {}", left);
+            println!("  right: {}", right);
+            println!("  key  : {}", key);
+            println!("  out  : {}", output);
+
+            if let Err(e) = engine::join_csv_in_memory(&left, &right, &key, &output) {
+                eprintln!("Error ejecutando join: {e:?}");
+                std::process::exit(1);
+            }
+
+            println!("Join completado. Archivo de salida: {}", output);
+        }
+
 
         Commands::Workers => {
             let url = format!("{}/api/v1/workers", base_url);
