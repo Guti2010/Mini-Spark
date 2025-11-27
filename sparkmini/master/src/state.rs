@@ -15,6 +15,8 @@ pub struct AppState {
     pub tasks_queue: Arc<Mutex<VecDeque<Task>>>,
     // tareas ya asignadas pero no completadas
     pub in_flight: Arc<Mutex<HashMap<TaskId, InFlight>>>,
+    pub worker_order: Arc<Mutex<Vec<WorkerId>>>,
+    pub rr_cursor: Arc<Mutex<usize>>,
 }
 
 impl AppState {
@@ -24,6 +26,9 @@ impl AppState {
             workers: Arc::new(Mutex::new(HashMap::new())),
             tasks_queue: Arc::new(Mutex::new(VecDeque::new())),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+
+            worker_order: Arc::new(Mutex::new(Vec::new())),
+            rr_cursor: Arc::new(Mutex::new(0)),
         }
     }
 }
