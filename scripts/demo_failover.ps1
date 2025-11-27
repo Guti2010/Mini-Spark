@@ -3,22 +3,19 @@ $ErrorActionPreference = "Stop"
 
 . "$PSScriptRoot\helpers.ps1"
 
-# ajusta estos nombres a tus servicios
-$Worker1 = "worker-1"
-$Worker2 = "worker-2"
+# Estos son los NOMBRES DE SERVICIO en docker-compose.yml,
+# no los nombres de contenedor.
+$MasterService  = "master"
+$Worker1Service = "worker-1"
+$Worker2Service = "worker-2"
 
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  Demo: tolerancia a fallos (failover)" -ForegroundColor Yellow
 Write-Host "========================================" -ForegroundColor Cyan
 
-Write-Host ""
-Write-Host "1) Levantando master + 2 workers..."
-docker compose up -d master $Worker1 $Worker2 | Out-Null
-
-Start-Sleep -Seconds 3
 
 Write-Host ""
-Write-Host "2) Enviando job WordCount grande (wc-failover)..."
+Write-Host "1) Enviando job WordCount grande (wc-failover)..."
 
 $submitOutput = docker compose run --rm client submit "wc-failover"
 $submitOutput | ForEach-Object { Write-Host $_ }
@@ -33,9 +30,19 @@ Write-Host ""
 Write-Host "Job creado con id = $JobId" -ForegroundColor Green
 
 Write-Host ""
-Write-Host "3) Esperando un poco y matando $Worker1..."
-Start-Sleep -Seconds 5
-docker compose stop $Worker1 | Out-Null
+Write-Host "3) Esperando un poco y matando una instancia de $Worker1Service..."
+
+
+$worker1ContainerId = docker compose ps -q | Select-Object -Index 1
+
+if (-not $worker1ContainerId) {
+    Write-Host "ERROR: no encontré contenedor para el servicio $Worker1Service" -ForegroundColor Red
+    exit 1
+}
+
+docker stop $worker1ContainerId | Out-Null
+
+Start-Sleep -Seconds 3
 
 Write-Host "Worker parado. El master debería marcarlo DEAD y reencolar tareas." -ForegroundColor Yellow
 

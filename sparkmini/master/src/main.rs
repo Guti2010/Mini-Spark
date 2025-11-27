@@ -10,7 +10,7 @@ use tracing::info;
 
 // ---------- constantes que usa failover.rs ----------
 pub const MAX_TASK_ATTEMPTS: u32 = 3;
-pub const WORKER_HEARTBEAT_TIMEOUT_SECS: u64 = 10;
+pub const WORKER_HEARTBEAT_TIMEOUT_SECS: u64 = 3;
 pub const FAILOVER_SWEEP_INTERVAL_SECS: u64 = 3;
 // ----------------------------------------------------
 
