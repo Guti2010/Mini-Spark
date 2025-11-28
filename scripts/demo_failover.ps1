@@ -17,7 +17,7 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "1) Enviando job WordCount grande (wc-failover)..."
 
-$submitOutput = docker compose run --rm client submit "wc-failover"
+$submitOutput = docker compose run --rm client word-count "wc-failover"
 $submitOutput | ForEach-Object { Write-Host $_ }
 
 $JobId = Get-JobIdFromSubmitOutput -Lines $submitOutput

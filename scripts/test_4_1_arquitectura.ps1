@@ -52,8 +52,8 @@ Step "STEP 3 - Consultar workers via CLI (client workers)" {
 # STEP 4: Enviar job WordCount
 $global:jobId = $null
 Step 'STEP 4 - Enviar job WordCount (submit "arch-test")' {
-    Write-Host ">> docker compose run --rm client submit `\"arch-test`\"" -ForegroundColor Yellow
-    $submitOut = docker compose run --rm client submit "arch-test"
+    Write-Host ">> docker compose run --rm client word-count `\"arch-test`\"" -ForegroundColor Yellow
+    $submitOut = docker compose run --rm client word-count "arch-test"
 
     Write-Host ""
     Write-Host "Salida del submit:" -ForegroundColor Green

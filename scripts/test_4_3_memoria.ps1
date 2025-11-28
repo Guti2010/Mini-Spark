@@ -54,7 +54,7 @@ docker compose run --rm client workers
 # 3) Ejecutar job "mem-test"
 Write-Host ""
 Write-Host ">> Enviando job 'mem-test' sobre /data/input/* (incluye memory-big.txt)..." -ForegroundColor Yellow
-$submitOut = docker compose run --rm client submit "mem-test"
+$submitOut = docker compose run --rm client word-count "mem-test"
 
 $line = $submitOut | Select-String "id:" | Select-Object -First 1
 if (-not $line) {

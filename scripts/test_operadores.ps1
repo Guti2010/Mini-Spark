@@ -22,7 +22,7 @@ function Invoke-JobAndWait {
     Write-Host ""
     Write-Host "Enviando job: $JobName (estado esperado: $ExpectedEstado)" -ForegroundColor Cyan
 
-    $submitOutput = docker compose run --rm client submit $JobName
+    $submitOutput = docker compose run --rm client word-count $JobName
     $submitOutput | ForEach-Object { Write-Host $_ }
 
     $JobId = Get-JobIdFromSubmitOutput -Lines $submitOutput
