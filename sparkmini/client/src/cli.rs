@@ -62,9 +62,13 @@ enum Commands {
 /// Construye un DAG fijo de WordCount estilo enunciado:
 /// read -> flat -> map1 -> agg
 /// Devuelve: (dag, input_glob)
-fn build_wordcount_dag() -> (Dag, String) {
+fn build_wordcount_dag(file: &str) -> (Dag, String) {
     // Patrón de entrada que usará el master para crear tareas
-    let input_glob = "/data/input/*".to_string();
+    let input_glob = if file == "all" {
+        "/data/input/*".to_string()
+    } else {
+        format!("/data/input/{}", file)
+    };
 
     // Nodo "read": lee archivos de texto (podría ser read_csv si usas CSV)
     let read = DagNode {
@@ -129,7 +133,7 @@ pub async fn run() -> Result<()> {
             let url = format!("{}/api/v1/jobs", base_url);
 
             // Construimos el DAG fijo de WordCount y el patrón de entrada
-            let (dag, input_glob) = build_wordcount_dag();
+            let (dag, input_glob) = build_wordcount_dag(&name);
 
             // OJO: JobRequest en common solo tiene estos campos ahora
             let req = JobRequest {
