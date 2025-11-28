@@ -71,7 +71,9 @@ impl SpillingAggregator {
         }
 
         self.spill_counter += 1;
-        let filename = format!("spill-{}.jsonl", self.spill_counter);
+        // ← Hacemos el nombre de spill único por proceso + contador
+        let pid = std::process::id();
+        let filename = format!("spill-{}-{}.jsonl", pid, self.spill_counter);
         let path = Path::new(&self.dir).join(filename);
         let mut writer = BufWriter::new(File::create(&path)?);
 
@@ -203,7 +205,12 @@ pub fn op_reduce_by_key(input: Records, key_field: &str, value_field: &str) -> R
         }
     }
 
-    acc.into_iter()
+    // determinista: ordenar por clave
+    let mut entries: Vec<(String, u64)> = acc.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    entries
+        .into_iter()
         .map(|(k, v)| {
             json!({
                 key_field: k,
@@ -259,7 +266,6 @@ fn wc_filter_nonempty(rec: &Record) -> bool {
 
 /// Pipeline completo de WordCount en memoria,
 /// usando explícitamente map -> flat_map -> filter -> reduce_by_key.
-/// Esto es tu "mini-Spark" en pequeño.
 pub fn wordcount_from_lines_with_operators<I>(lines: I) -> Records
 where
     I: IntoIterator,
@@ -370,7 +376,7 @@ pub fn read_csv_to_records(path: &str) -> io::Result<Records> {
         None => return Ok(out),
     };
 
-    // 🔧 Limpia BOM por si viene de Excel/Windows
+    // Limpia BOM por si viene de Excel/Windows
     let header_line = header_line.trim_start_matches('\u{feff}');
 
     let headers: Vec<String> = header_line
@@ -389,10 +395,8 @@ pub fn read_csv_to_records(path: &str) -> io::Result<Records> {
 
         for (idx, h) in headers.iter().enumerate() {
             let mut val = cols.get(idx).unwrap_or(&"").trim();
-
-            // 🔧 Por si algún valor raro viene con BOM
+            // Por si algún valor viene con BOM
             val = val.trim_start_matches('\u{feff}');
-
             obj.insert(h.clone(), json!(val));
         }
 
@@ -401,7 +405,6 @@ pub fn read_csv_to_records(path: &str) -> io::Result<Records> {
 
     Ok(out)
 }
-
 
 pub fn read_jsonl_to_records(path: &str) -> io::Result<Records> {
     let file = File::open(path)?;
@@ -510,12 +513,19 @@ pub fn wordcount_csv_file_shuffled_local(
     let token_records = wc_stage1_from_records(recs, text_field);
 
     // 3) Shuffle: token -> particiones por hash(token)
+    //    Usamos un stage_id único por archivo para evitar colisiones entre tareas.
+    let file_key = Path::new(input_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("nofile");
+    let stage_id = format!("wc_stage1_csv_{}", file_key);
+
     let partitions = shuffle_to_partitions(
         token_records,
         "token",
         num_partitions,
         tmp_dir,
-        "wc_stage1_csv",
+        &stage_id,
     )?;
 
     // 4) Reduce: sum(count) por token en todas las particiones
@@ -538,12 +548,18 @@ pub fn wordcount_jsonl_file_shuffled_local(
     let token_records = wc_stage1_from_records(recs, text_field);
 
     // 3) Shuffle: token -> particiones por hash(token)
+    let file_key = Path::new(input_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("nofile");
+    let stage_id = format!("wc_stage1_jsonl_{}", file_key);
+
     let partitions = shuffle_to_partitions(
         token_records,
         "token",
         num_partitions,
         tmp_dir,
-        "wc_stage1_jsonl",
+        &stage_id,
     )?;
 
     // 4) Reduce: sum(count) por token en todas las particiones
@@ -638,9 +654,26 @@ pub fn reduce_partitions_to_file(
     value_field: &str,
     output_path: &str,
 ) -> io::Result<()> {
-    // Acumulador con spill en /data/tmp/spill_reduce
-    let spill_dir = "/data/tmp/spill_reduce";
-    let mut agg = SpillingAggregator::new(spill_dir, max_in_mem_keys())?;
+    // Si no hay particiones, generamos un archivo vacío y salimos.
+    if partitions.is_empty() {
+        if let Some(parent) = Path::new(output_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let _ = File::create(output_path)?;
+        return Ok(());
+    }
+
+    // Directorio de spill "local" a las particiones, para evitar colisiones entre tareas.
+    let first_part_dir = Path::new(&partitions[0].path)
+        .parent()
+        .unwrap_or_else(|| Path::new("/data/tmp"));
+
+    let spill_dir_path = first_part_dir.join("spill_reduce");
+    let spill_dir_str = spill_dir_path.to_string_lossy().to_string();
+
+    let mut agg = SpillingAggregator::new(&spill_dir_str, max_in_mem_keys())?;
 
     for part in partitions {
         let recs = read_partition(&part.path)?;
@@ -659,7 +692,6 @@ pub fn reduce_partitions_to_file(
     agg.finalize_to_csv(output_path)
 }
 
-
 /* =========================
    Demo local: WordCount con shuffle a particiones
    ========================= */
@@ -668,7 +700,7 @@ pub fn reduce_partitions_to_file(
 ///
 /// 1. Lee líneas de `input_path`.
 /// 2. Genera registros { "token": <palabra>, "count": 1 }.
-/// 3. Hace shuffle a N particiones en `tmp_dir/wc_stage1/`.
+/// 3. Hace shuffle a N particiones en `tmp_dir/wc_stage1_<archivo>/`.
 /// 4. Reduce todas las particiones y escribe CSV en `output_path`.
 pub fn wordcount_file_shuffled_local(
     input_path: &str,
@@ -685,8 +717,15 @@ pub fn wordcount_file_shuffled_local(
     let token_records = wc_stage1_make_token_records(lines);
 
     // 3) Shuffle: token -> particiones por hash(token)
+    //    Stage_id único por archivo
+    let file_key = Path::new(input_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("nofile");
+    let stage_id = format!("wc_stage1_{}", file_key);
+
     let partitions =
-        shuffle_to_partitions(token_records, "token", num_partitions, tmp_dir, "wc_stage1")?;
+        shuffle_to_partitions(token_records, "token", num_partitions, tmp_dir, &stage_id)?;
 
     // 4) Reduce: sum(count) por token en todas las particiones
     reduce_partitions_to_file(&partitions, "token", "count", output_path)
@@ -842,7 +881,6 @@ pub fn join_csv_in_memory(
     let right = read_csv_to_records(right_path)?;
 
     let joined = op_join_by_key(left, right, key_field);
-    
 
     if let Some(parent) = Path::new(output_path).parent() {
         if !parent.as_os_str().is_empty() {
@@ -861,4 +899,3 @@ pub fn join_csv_in_memory(
     writer.flush()?;
     Ok(())
 }
-

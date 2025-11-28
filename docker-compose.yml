@@ -18,7 +18,7 @@ services:
     environment:
       - MASTER_BASE_URL=http://master:8080
       - WORKER_CONCURRENCY=2
-      - MAX_IN_MEM_KEYS=100 
+      - MAX_IN_MEM_KEYS=100000 
       - RUST_LOG=info,worker=info
     depends_on:
       - master
