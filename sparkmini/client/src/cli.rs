@@ -22,7 +22,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Envía un job nuevo con un nombre (WordCount fijo)
-    Submit {
+    WordCount {
         #[arg(value_name = "NOMBRE")]
         name: String,
     },
@@ -129,7 +129,7 @@ pub async fn run() -> Result<()> {
     let base_url = master_base_url();
 
     match cli.command {
-        Commands::Submit { name } => {
+        Commands::WordCount { name } => {
             let url = format!("{}/api/v1/jobs", base_url);
 
             // Construimos el DAG fijo de WordCount y el patrón de entrada
