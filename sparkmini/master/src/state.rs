@@ -9,29 +9,25 @@ use std::{
 
 #[derive(Clone)]
 pub struct AppState {
-    pub jobs: Arc<Mutex<HashMap<JobId, JobInfo>>>,
-    pub workers: Arc<Mutex<HashMap<WorkerId, WorkerMeta>>>,
-    // tareas pendientes de asignar
     pub tasks_queue: Arc<Mutex<VecDeque<Task>>>,
-    // tareas ya asignadas pero no completadas
+    pub jobs: Arc<Mutex<HashMap<JobId, JobInfo>>>,
     pub in_flight: Arc<Mutex<HashMap<TaskId, InFlight>>>,
-    pub worker_order: Arc<Mutex<Vec<WorkerId>>>,
+    pub workers: Arc<Mutex<HashMap<WorkerId, WorkerMeta>>>,
     pub rr_cursor: Arc<Mutex<usize>>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
-            jobs: Arc::new(Mutex::new(HashMap::new())),
-            workers: Arc::new(Mutex::new(HashMap::new())),
             tasks_queue: Arc::new(Mutex::new(VecDeque::new())),
+            jobs: Arc::new(Mutex::new(HashMap::new())),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
-
-            worker_order: Arc::new(Mutex::new(Vec::new())),
+            workers: Arc::new(Mutex::new(HashMap::new())),
             rr_cursor: Arc::new(Mutex::new(0)),
         }
     }
 }
+
 
 #[derive(Debug, Clone)]
 pub struct WorkerMeta {

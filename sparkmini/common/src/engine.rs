@@ -861,3 +861,4 @@ pub fn join_csv_in_memory(
     writer.flush()?;
     Ok(())
 }
+

@@ -179,45 +179,45 @@ async fn get_job_results(
 }
 
 // Registra un worker nuevo
-async fn register_worker(
+pub async fn register_worker(
     State(state): State<AppState>,
     Json(req): Json<WorkerRegisterRequest>,
 ) -> Json<WorkerRegisterResponse> {
-    let worker_id = uuid::Uuid::new_v4().to_string();
+
+    // Generamos un ID único
+    let worker_id = format!("{}-{}", req.hostname, Utc::now().timestamp_millis());
 
     {
         let mut workers = state.workers.lock().unwrap();
+
         workers.insert(
             worker_id.clone(),
             WorkerMeta {
-                hostname: req.hostname,
-                last_heartbeat: SystemTime::now(),
-                dead: false,
+                hostname: req.hostname.clone(),
                 max_concurrency: req.max_concurrency,
+                // tiempos/estado
+                last_heartbeat: SystemTime::now(),
+                last_cpu_percent: Some(0.0),
+                last_mem_bytes: Some(0),
+                total_task_time_ms: 0,
 
+                // métricas de tareas
                 tasks_started: 0,
                 tasks_succeeded: 0,
                 tasks_failed: 0,
-                total_task_time_ms: 0,
 
-                last_cpu_percent: None,
-                last_mem_bytes: None,
+                // estado de vida
+                dead: false,
             },
         );
     }
 
-    {
-        let mut order = state.worker_order.lock().unwrap();
-        order.push(worker_id.clone());
-    }
+    info!("Registrado worker {}", worker_id);
 
-
-    info!(
-        "worker registrado: {} (max_concurrency={})",
-        worker_id, req.max_concurrency
-    );
     Json(WorkerRegisterResponse { worker_id })
 }
+
+
 
 
 
@@ -238,110 +238,94 @@ async fn worker_heartbeat(
 }
 
 // Asigna la siguiente tarea en cola (si hay)
-async fn assign_task(
+pub async fn assign_task(
     State(state): State<AppState>,
     Json(req): Json<TaskAssignmentRequest>,
 ) -> Json<TaskAssignmentResponse> {
-    // 1) Cuántas tareas tiene ya este worker en vuelo
+    //---------------------------------------------
+    //       ROUND ROBIN DINÁMICO (FAILOVER PROOF)
+    //---------------------------------------------
+    let chosen_worker_opt = {
+        let workers = state.workers.lock().unwrap();
+
+        let mut alive: Vec<WorkerId> = workers
+            .iter()
+            .filter(|(_, meta)| !meta.dead)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        if alive.is_empty() {
+            info!("No hay workers vivos para asignar tareas");
+            None
+        } else {
+            let mut cursor = state.rr_cursor.lock().unwrap();
+
+            if *cursor >= alive.len() {
+                *cursor = 0;
+            }
+
+            let chosen = alive[*cursor].clone();
+            *cursor = (*cursor + 1) % alive.len();
+
+            Some(chosen)
+        }
+    };
+
+    let worker_id = match chosen_worker_opt {
+        Some(w) => w,
+        None => return Json(TaskAssignmentResponse { task: None }),
+    };
+
+    //---------------------------------------------
+    //   CHEQUEO CONCURRENCIA DEL WORKER ELEGIDO
+    //---------------------------------------------
     let active_for_worker: usize = {
         let in_flight = state.in_flight.lock().unwrap();
         in_flight
             .values()
-            .filter(|entry| entry.worker_id == req.worker_id)
+            .filter(|entry| entry.worker_id == worker_id)
             .count()
     };
 
-    // 2) Capacidad máxima de este worker (max_concurrency)
     let max_for_worker: u32 = {
         let workers = state.workers.lock().unwrap();
         workers
-            .get(&req.worker_id)
+            .get(&worker_id)
             .map(|m| m.max_concurrency)
-            .unwrap_or(1) 
+            .unwrap_or(1)
     };
 
-    // Si ya está al tope, no le damos más tareas
     if active_for_worker as u32 >= max_for_worker {
         info!(
-            "worker {} pidió tarea pero ya tiene {}/{} en vuelo",
-            req.worker_id, active_for_worker, max_for_worker
+            "worker {} pedido pero lleno {}/{}",
+            worker_id, active_for_worker, max_for_worker
         );
         return Json(TaskAssignmentResponse { task: None });
     }
 
-    // 3) Política de round-robin entre workers.
-    //    Solo damos tarea si es "su turno" en el anillo.
-    let turn_is_mine: bool = {
-        let order = state.worker_order.lock().unwrap();
-
-        if order.is_empty() {
-            // Si aún no hay orden registrado, no bloqueamos.
-            true
-        } else {
-            // Buscar la posición de este worker en el vector de RR.
-            if let Some(pos) = order.iter().position(|id| id == &req.worker_id) {
-                let len = order.len();
-
-                let mut cursor = state.rr_cursor.lock().unwrap();
-                if *cursor >= len {
-                    *cursor = 0;
-                }
-
-                if *cursor != pos {
-                    info!(
-                        "worker {} pidió tarea pero no es su turno en round-robin (cursor={}, pos={})",
-                        req.worker_id, *cursor, pos
-                    );
-                    false
-                } else {
-                    // Es su turno: avanzamos el cursor al siguiente.
-                    *cursor = (*cursor + 1) % len;
-                    true
-                }
-            } else {
-                // Si por algún motivo el worker no está en la lista,
-                // no bloqueamos (modo compatibilidad).
-                true
-            }
-        }
-    };
-
-    if !turn_is_mine {
-        return Json(TaskAssignmentResponse { task: None });
-    }
-
-    // 4) Sacar la siguiente tarea de la cola global
+    //---------------------------------------------
+    //           SACAR TAREA DE LA COLA
+    //---------------------------------------------
     let task_opt = {
         let mut queue = state.tasks_queue.lock().unwrap();
         queue.pop_front()
     };
 
     if let Some(ref t) = task_opt {
-        info!(
-            "asignando tarea {} (job={}, input={} output={}) al worker {} ({}/{} en vuelo -> +1)",
-            t.id,
-            t.job_id,
-            t.input_path,
-            t.output_path,
-            req.worker_id,
-            active_for_worker,
-            max_for_worker,
-        );
+        info!("asignando tarea {} al worker {}", t.id, worker_id);
 
-        // 5) Registrar la tarea en in_flight con timestamp de inicio
         {
             let mut in_flight = state.in_flight.lock().unwrap();
             in_flight.insert(
                 t.id.clone(),
                 InFlight {
                     task: t.clone(),
-                    worker_id: req.worker_id.clone(),
+                    worker_id: worker_id.clone(),
                     started_at: SystemTime::now(),
                 },
             );
         }
 
-        // 6) Actualizar el job: marcar como Running y setear started_at si es la primera vez
         {
             let mut jobs = state.jobs.lock().unwrap();
             if let Some(job) = jobs.get_mut(&t.job_id) {
@@ -354,22 +338,17 @@ async fn assign_task(
             }
         }
 
-        // 7) Métricas del worker: incrementar tareas iniciadas
         {
             let mut workers = state.workers.lock().unwrap();
-            if let Some(meta) = workers.get_mut(&req.worker_id) {
+            if let Some(meta) = workers.get_mut(&worker_id) {
                 meta.tasks_started += 1;
             }
         }
-    } else {
-        info!(
-            "worker {} pidió tarea pero no hay tareas en cola",
-            req.worker_id
-        );
     }
 
     Json(TaskAssignmentResponse { task: task_opt })
 }
+
 
 
 // Worker reporta que terminó una tarea
