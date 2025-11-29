@@ -692,6 +692,94 @@ pub fn reduce_partitions_to_file(
     agg.finalize_to_csv(output_path)
 }
 
+use std::time::{Duration, Instant};
+
+/// Estado incremental para ejecutar WordCount por “quantums”.
+pub struct WordcountTaskState {
+    reader: BufReader<File>,
+    counts: HashMap<String, u64>,
+    output_path: String,
+    eof: bool,
+}
+
+impl WordcountTaskState {
+    /// Crea un wordcount incremental para un archivo.
+    pub fn new(input_path: &str, output_path: &str) -> io::Result<Self> {
+        let file = File::open(input_path)?;
+        let reader = BufReader::new(file);
+
+        Ok(Self {
+            reader,
+            counts: HashMap::new(),
+            output_path: output_path.to_string(),
+            eof: false,
+        })
+    }
+
+    /// Ejecuta trabajo por un quantum.
+    /// Devuelve:
+    ///   Ok(false) → aún no termina; reencolar  
+    ///   Ok(true)  → terminó  
+    pub fn step(&mut self, quantum: Duration) -> io::Result<bool> {
+        if self.eof {
+            return Ok(true);
+        }
+
+        let start = Instant::now();
+        let mut line = String::new();
+
+        // Procesar líneas hasta consumir el quantum
+        loop {
+            if start.elapsed() >= quantum {
+                return Ok(false);
+            }
+
+            line.clear();
+            let read = self.reader.read_line(&mut line)?;
+            if read == 0 {
+                self.eof = true;
+                return self.flush_output().map(|_| true);
+            }
+
+            for raw in line.split_whitespace() {
+                let cleaned: String = raw.chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '_')
+                    .collect::<String>()
+                    .to_lowercase();
+
+                if !cleaned.is_empty() {
+                    *self.counts.entry(cleaned).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    fn flush_output(&mut self) -> io::Result<()> {
+        // Crear carpeta
+        if let Some(parent) = Path::new(&self.output_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let out = File::create(&self.output_path)?;
+        let mut writer = BufWriter::new(out);
+
+        let mut entries: Vec<(String, u64)> =
+            self.counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (k, v) in entries {
+            writeln!(writer, "{},{}", k, v)?;
+        }
+
+        Ok(())
+    }
+}
+
+
+
+
 /* =========================
    Demo local: WordCount con shuffle a particiones
    ========================= */

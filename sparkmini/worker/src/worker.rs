@@ -9,25 +9,56 @@ use common::{
     WorkerRegisterRequest,
     WorkerRegisterResponse,
 };
-use common::engine; 
+use common::engine::WordcountTaskState;
 use hostname;
 use reqwest::Client;
-use std::{env, sync::Arc, time::Duration};
-use tokio::sync::Semaphore;
+use std::{env, io, time::Duration};
 use tokio::time::sleep;
 use tracing::{info, warn};
 use tracing_subscriber;
-use std::path::Path;
-use sysinfo::{System, SystemExt, CpuExt};
-
+use sysinfo::{CpuExt, System, SystemExt};
+use std::collections::VecDeque;
 
 const DEFAULT_WORKER_CONCURRENCY: u32 = 2;
 
+/// Representa una tarea activa dentro del worker para ejecución en round-robin.
+pub struct ActiveTask {
+    pub task: common::Task,
+    pub dag: Dag,
+    pub state: WordcountTaskState,
+}
+
+impl ActiveTask {
+    /// Crea una tarea activa a partir del Task y el DAG.
+    /// Nota: por ahora el DAG no se usa dentro de WordcountTaskState,
+    /// pero lo dejamos por si luego quieres soportar más tipos de jobs.
+    pub fn new(task: &common::Task, dag: Dag) -> io::Result<Self> {
+        let input = task.input_path.clone();
+        let output = task.output_path.clone();
+        let state = WordcountTaskState::new(&input, &output)?;
+
+        Ok(Self {
+            task: task.clone(),
+            dag,
+            state,
+        })
+    }
+
+    /// Ejecuta un “quantum” sobre la tarea.
+    ///
+    /// Devuelve:
+    /// - Ok(true)  => la tarea terminó (se debe reportar complete al master).
+    /// - Ok(false) => la tarea aún no termina (se reencola en la run queue).
+    pub fn step(&mut self, quantum: Duration) -> io::Result<bool> {
+        self.state.step(quantum)
+    }
+}
+
 /// Loop principal del worker.
 /// - Se registra en el master.
-/// - Hace heartbeats periódicos.
-/// - Pide tareas mientras tenga "slots" libres.
-/// - Ejecuta cada tarea en paralelo (hasta WORKER_CONCURRENCY).
+/// - Hace heartbeats periódicos con CPU/MEM (para failover / health).
+/// - Pide tareas hasta tener `concurrency` activas.
+/// - Ejecuta las tareas en round-robin, con quantums de 100 ms.
 pub async fn run() -> Result<()> {
     tracing_subscriber::fmt::init();
 
@@ -64,10 +95,14 @@ pub async fn run() -> Result<()> {
         worker_id, concurrency, base_url
     );
 
-    let sem = Arc::new(Semaphore::new(concurrency));
-
     // System para leer CPU y memoria
     let mut sys = System::new_all();
+
+    // Cola de tareas activas para round-robin
+    let mut run_queue: VecDeque<ActiveTask> = VecDeque::new();
+
+    // Quantum por tarea
+    let quantum = Duration::from_millis(100);
 
     loop {
         // --------- Heartbeat al master con CPU/MEM ---------
@@ -89,29 +124,28 @@ pub async fn run() -> Result<()> {
             .send()
             .await;
 
-        // --------- Control de concurrencia local ---------
-        let permit = match sem.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                // No hay capacidad para nuevas tareas; esperamos un poco
-                sleep(Duration::from_millis(500)).await;
-                continue;
-            }
-        };
+        // --------- Pedir tareas nuevas si hay espacio en la cola ---------
+        while run_queue.len() < concurrency {
+            let assign_url = format!("{}/api/v1/tasks/next", base_url);
+            let res = client
+                .post(&assign_url)
+                .json(&TaskAssignmentRequest {
+                    worker_id: worker_id.clone(),
+                })
+                .send()
+                .await?;
 
-        // Pedimos tarea al master
-        let assign_url = format!("{}/api/v1/tasks/next", base_url);
-        let res = client
-            .post(&assign_url)
-            .json(&TaskAssignmentRequest {
-                worker_id: worker_id.clone(),
-            })
-            .send()
-            .await?;
+            let assignment: TaskAssignmentResponse = res.json().await?;
 
-        let assignment: TaskAssignmentResponse = res.json().await?;
+            let Some(task) = assignment.task else {
+                info!(
+                    "worker {} pidió tarea pero no hay tareas en cola (run_queue={})",
+                    worker_id,
+                    run_queue.len()
+                );
+                break;
+            };
 
-        if let Some(task) = assignment.task {
             info!(
                 "tengo tarea {} del job {} (input={} output={})",
                 task.id, task.job_id, task.input_path, task.output_path
@@ -128,7 +162,7 @@ pub async fn run() -> Result<()> {
                     task.id,
                     job_resp.status()
                 );
-                // No tenemos DAG -> reportamos fallo y liberamos el slot
+                // No tenemos DAG -> reportamos fallo
                 let complete_url = format!("{}/api/v1/tasks/complete", base_url);
                 let _ = client
                     .post(&complete_url)
@@ -138,66 +172,81 @@ pub async fn run() -> Result<()> {
                     })
                     .send()
                     .await;
-                drop(permit);
                 continue;
             }
 
             let job_info: JobInfo = job_resp.json().await?;
             let dag = job_info.dag.clone();
 
-            let client_cloned = client.clone();
-            let base_url_cloned = base_url.clone();
+            match ActiveTask::new(&task, dag) {
+                Ok(active) => {
+                    run_queue.push_back(active);
+                }
+                Err(e) => {
+                    warn!(
+                        "error inicializando ActiveTask para tarea {}: {:?}",
+                        task.id, e
+                    );
+                    // Reportamos fallo al master
+                    let complete_url = format!("{}/api/v1/tasks/complete", base_url);
+                    let _ = client
+                        .post(&complete_url)
+                        .json(&TaskCompleteRequest {
+                            task_id: task.id.clone(),
+                            success: false,
+                        })
+                        .send()
+                        .await;
+                }
+            }
+        }
 
-            tokio::spawn(async move {
-                let tmp_dir = "/data/tmp".to_string();
-                let input_path = task.input_path.clone();
-                let output_path = task.output_path.clone();
-                let num_partitions = task.parallelism.max(1);
+        // --------- Si no hay nada para ejecutar, esperamos un poco ---------
+        if run_queue.is_empty() {
+            sleep(Duration::from_secs(2)).await;
+            continue;
+        }
 
-                // --- 2) Ejecutar usando el DAG ---
-                let handle = tokio::task::spawn_blocking(move || {
-                    engine::execute_wordcount_dag_for_file(
-                        &dag,
-                        &input_path,
-                        &tmp_dir,
-                        num_partitions,
-                        &output_path,
-                    )
-                });
+        // --------- Round-robin local sobre run_queue ---------
+        let mut active = run_queue
+            .pop_front()
+            .expect("run_queue no debería estar vacía aquí");
+        let task_id = active.task.id.clone();
 
-                let success = match handle.await {
-                    Ok(Ok(())) => {
-                        info!("terminé tarea {} correctamente", task.id);
-                        true
-                    }
-                    Ok(Err(e)) => {
-                        warn!("error procesando tarea {}: {:?}", task.id, e);
-                        false
-                    }
-                    Err(e) => {
-                        warn!("panic o join error en tarea {}: {:?}", task.id, e);
-                        false
-                    }
-                };
+        match active.step(quantum) {
+            Ok(true) => {
+                // La tarea terminó en este quantum
+                info!("terminé tarea {} correctamente (RR)", task_id);
 
-                let complete_url = format!("{}/api/v1/tasks/complete", base_url_cloned);
-                let _ = client_cloned
+                let complete_url = format!("{}/api/v1/tasks/complete", base_url);
+                let _ = client
                     .post(&complete_url)
                     .json(&TaskCompleteRequest {
-                        task_id: task.id.clone(),
-                        success,
+                        task_id: task_id.clone(),
+                        success: true,
                     })
                     .send()
                     .await;
+            }
+            Ok(false) => {
+                // La tarea aún no termina → la reencolamos al final
+                run_queue.push_back(active);
+            }
+            Err(e) => {
+                // Error durante la ejecución de la tarea
+                warn!("error procesando tarea {} en RR: {:?}", task_id, e);
 
-                drop(permit);
-            });
-        } else {
-            drop(permit);
-            info!("worker {} pidió tarea pero no hay", worker_id);
-            sleep(Duration::from_secs(2)).await;
+                let complete_url = format!("{}/api/v1/tasks/complete", base_url);
+                let _ = client
+                    .post(&complete_url)
+                    .json(&TaskCompleteRequest {
+                        task_id: task_id.clone(),
+                        success: false,
+                    })
+                    .send()
+                    .await;
+            }
         }
 
     }
 }
-
