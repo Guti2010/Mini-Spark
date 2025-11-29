@@ -3,10 +3,6 @@ name = "common"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "join-demo"
-path = "src/bin/join_demo.rs"
-
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

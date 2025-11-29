@@ -899,3 +899,531 @@ pub fn join_csv_in_memory(
     writer.flush()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{env, fs, io::Write, path::PathBuf};
+
+    fn temp_dir(sub: &str) -> PathBuf {
+        let base = env::temp_dir()
+            .join("engine_tests")
+            .join(sub);
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    /* ============
+       OPERADORES
+       ============ */
+
+    #[test]
+    fn op_map_aplica_funcion_a_cada_registro() {
+        let input = vec![json!({"x": 1}), json!({"x": 2})];
+
+        let out = op_map(input, |r| {
+            let mut o = r.clone();
+            let v = o["x"].as_i64().unwrap();
+            o["x"] = json!(v * 10);
+            o
+        });
+
+        assert_eq!(out, vec![json!({"x": 10}), json!({"x": 20})]);
+    }
+
+    #[test]
+    fn op_filter_filtra_por_predicado() {
+        let input = vec![
+            json!({"x": 1}),
+            json!({"x": 2}),
+            json!({"x": 3}),
+        ];
+
+        let out = op_filter(input, |r| r["x"].as_i64().unwrap() % 2 == 1);
+
+        assert_eq!(out, vec![json!({"x": 1}), json!({"x": 3})]);
+    }
+
+    #[test]
+    fn op_flat_map_expande_registros() {
+        let input = vec![
+            json!({"nums": [1, 2]}),
+            json!({"nums": [3]}),
+        ];
+
+        let out = op_flat_map(input, |r| {
+            r["nums"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| json!({"n": n}))
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(
+            out,
+            vec![
+                json!({"n": 1}),
+                json!({"n": 2}),
+                json!({"n": 3}),
+            ]
+        );
+    }
+
+    #[test]
+    fn op_reduce_by_key_agrupa_y_suma() {
+        let input = vec![
+            json!({"token": "a", "count": 1_u64}),
+            json!({"token": "b", "count": 1_u64}),
+            json!({"token": "a", "count": 2_u64}),
+        ];
+
+        let out = op_reduce_by_key(input, "token", "count");
+
+        // reduce_by_key ordena por clave
+        assert_eq!(
+            out,
+            vec![
+                json!({"token": "a", "count": 3_u64}),
+                json!({"token": "b", "count": 1_u64}),
+            ]
+        );
+    }
+
+    #[test]
+    fn op_join_by_key_inner_join_basico() {
+        let left = vec![
+            json!({"id": "u1", "nombre": "Ana"}),
+            json!({"id": "u2", "nombre": "Bob"}),
+        ];
+
+        let right = vec![
+            json!({"id": "u1", "compras": 10}),
+            json!({"id": "u3", "compras": 99}),
+        ];
+
+        let out = op_join_by_key(left, right, "id");
+        assert_eq!(out.len(), 1);
+
+        let rec = &out[0];
+        assert_eq!(rec["id"], json!("u1"));
+        assert_eq!(rec["nombre"], json!("Ana"));
+        assert_eq!(rec["compras"], json!(10));
+    }
+
+    #[test]
+    fn merge_records_respeta_campos_izquierda_y_prefija_derecha() {
+        let left = json!({"id": "u1", "x": 1, "compartido": "L"});
+        let right = json!({"id": "u1", "y": 2, "compartido": "R"});
+
+        let merged = super::merge_records(&left, &right, "id");
+
+        assert_eq!(merged["id"], json!("u1"));
+        assert_eq!(merged["x"], json!(1));
+        assert_eq!(merged["y"], json!(2));
+        // el valor de izquierda se mantiene y el de derecha va con prefijo
+        assert_eq!(merged["compartido"], json!("L"));
+        assert_eq!(merged["right_compartido"], json!("R"));
+    }
+
+    /* =========================
+       WORDCOUNT - HELPERS/PIPES
+       ========================= */
+
+    #[test]
+    fn wc_stage1_make_token_records_normaliza_y_cuenta() {
+        let lines = vec!["Hola hola, MUNDO!", "mundo_mundo 123"];
+
+        let recs = super::wc_stage1_make_token_records(lines);
+
+        // tokens: hola x2, mundo x1, mundo_mundo x1, 123 x1
+        let mut acc: HashMap<String, u64> = HashMap::new();
+        for r in recs {
+            let t = r["token"].as_str().unwrap().to_string();
+            let c = r["count"].as_u64().unwrap();
+            *acc.entry(t).or_insert(0) += c;
+        }
+
+        assert_eq!(acc.get("hola"), Some(&2));
+        assert_eq!(acc.get("mundo"), Some(&1));
+        assert_eq!(acc.get("mundo_mundo"), Some(&1));
+        assert_eq!(acc.get("123"), Some(&1));
+    }
+
+    #[test]
+    fn wc_stage1_from_records_lee_campo_texto() {
+        let input = vec![
+            json!({"text": "hola mundo"}),
+            json!({"text": "hola"}),
+        ];
+
+        let recs = super::wc_stage1_from_records(input, "text");
+        let mut acc: HashMap<String, u64> = HashMap::new();
+
+        for r in recs {
+            let t = r["token"].as_str().unwrap().to_string();
+            let c = r["count"].as_u64().unwrap();
+            *acc.entry(t).or_insert(0) += c;
+        }
+
+        assert_eq!(acc.get("hola"), Some(&2));
+        assert_eq!(acc.get("mundo"), Some(&1));
+    }
+
+    #[test]
+    fn wordcount_from_lines_cuenta_tokens_correctamente() {
+        let lines = vec!["hola hola mundo", "mundo a"];
+
+        let out = wordcount_from_lines(lines);
+
+        // tokens: a, hola, mundo
+        // a:1, hola:2, mundo:2  (orden alfabético por clave)
+        assert_eq!(
+            out,
+            vec![
+                json!({"token": "a",    "count": 1_u64}),
+                json!({"token": "hola", "count": 2_u64}),
+                json!({"token": "mundo","count": 2_u64}),
+            ]
+        );
+    }
+
+    #[test]
+    fn wordcount_from_lines_with_operators_equivale_a_version_simple() {
+        let lines = vec!["hola hola mundo", "mundo a"];
+
+        let simple = wordcount_from_lines(lines.clone());
+        let via_ops = wordcount_from_lines_with_operators(lines);
+
+        assert_eq!(simple, via_ops);
+    }
+
+    /* =========================
+       IO: CSV / JSONL / PARTITIONS
+       ========================= */
+
+    #[test]
+    fn read_csv_to_records_lee_encabezados_y_valores() {
+        let tmp = temp_dir("read_csv");
+        let csv_path = tmp.join("data.csv");
+        let mut f = fs::File::create(&csv_path).unwrap();
+
+        writeln!(f, "nombre,edad").unwrap();
+        writeln!(f, "Ana,30").unwrap();
+        writeln!(f, "Bob,25").unwrap();
+
+        let recs = read_csv_to_records(csv_path.to_str().unwrap()).unwrap();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0]["nombre"], json!("Ana"));
+        assert_eq!(recs[0]["edad"], json!("30"));
+        assert_eq!(recs[1]["nombre"], json!("Bob"));
+    }
+
+    #[test]
+    fn read_csv_to_records_soporta_archivo_vacio() {
+        let tmp = temp_dir("read_csv_empty");
+        let csv_path = tmp.join("data.csv");
+        fs::File::create(&csv_path).unwrap(); // sin contenido
+
+        let recs = read_csv_to_records(csv_path.to_str().unwrap()).unwrap();
+        assert!(recs.is_empty());
+    }
+
+    #[test]
+    fn read_jsonl_to_records_lee_un_objeto_por_linea() {
+        let tmp = temp_dir("read_jsonl");
+        let jsonl_path = tmp.join("data.jsonl");
+        let mut f = fs::File::create(&jsonl_path).unwrap();
+
+        writeln!(f, "{}", r#"{"x":1}"#).unwrap();
+        writeln!(f, "{}", r#"{"x":2, "y":"ok"}"#).unwrap();
+
+        let recs = read_jsonl_to_records(jsonl_path.to_str().unwrap()).unwrap();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0]["x"], json!(1));
+        assert_eq!(recs[1]["y"], json!("ok"));
+    }
+
+    #[test]
+    fn read_partition_roundtrip_jsonl() {
+        let tmp = temp_dir("read_part");
+        let p_path = tmp.join("part.jsonl");
+        let mut f = fs::File::create(&p_path).unwrap();
+
+        writeln!(f, "{}", r#"{"k":"a","v":1}"#).unwrap();
+        writeln!(f, "{}", r#"{"k":"b","v":2}"#).unwrap();
+
+        let recs = read_partition(p_path.to_str().unwrap()).unwrap();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0]["k"], json!("a"));
+        assert_eq!(recs[1]["v"], json!(2));
+    }
+
+    /* =========================
+       HASH / SHUFFLE / REDUCE
+       ========================= */
+
+    #[test]
+    fn hash_key_to_partition_retorna_id_en_rango() {
+        let n = 10;
+        for key in ["a", "b", "c", "xyz", "otro"] {
+            let pid = super::hash_key_to_partition(key, n);
+            assert!(pid < n);
+        }
+    }
+
+    #[test]
+    fn shuffle_to_partitions_y_reduce_partitions_to_file_agregan_valores() {
+        let tmp = temp_dir("shuffle_reduce");
+        let tmp_str = tmp.to_string_lossy().to_string();
+
+        let input = vec![
+            json!({"token": "a", "count": 1_u64}),
+            json!({"token": "b", "count": 1_u64}),
+            json!({"token": "a", "count": 1_u64}),
+        ];
+
+        let parts = shuffle_to_partitions(
+            input,
+            "token",
+            2,
+            &tmp_str,
+            "stage_test",
+        )
+        .unwrap();
+
+        let out_path = tmp.join("out.csv");
+        let out_str = out_path.to_string_lossy().to_string();
+
+        reduce_partitions_to_file(&parts, "token", "count", &out_str).unwrap();
+
+        let content = fs::read_to_string(out_path).unwrap();
+        let mut lines: Vec<&str> = content.lines().collect();
+        lines.sort();
+
+        assert_eq!(lines, vec!["a,2", "b,1"]);
+    }
+
+    #[test]
+    fn reduce_partitions_to_file_con_lista_vacia_crea_archivo_vacio() {
+        let tmp = temp_dir("reduce_empty");
+        let out_path = tmp.join("out.csv");
+        let out_str = out_path.to_string_lossy().to_string();
+
+        reduce_partitions_to_file(&[], "token", "count", &out_str).unwrap();
+
+        assert!(out_path.exists());
+        let content = fs::read_to_string(out_path).unwrap();
+        assert!(content.trim().is_empty());
+    }
+
+    /* =========================
+       SPILLING AGGREGATOR
+       ========================= */
+
+    #[test]
+    fn max_in_mem_keys_respeta_env_var() {
+        env::set_var("MAX_IN_MEM_KEYS", "1234");
+        assert_eq!(super::max_in_mem_keys(), 1234);
+        env::remove_var("MAX_IN_MEM_KEYS");
+    }
+
+    #[test]
+    fn spilling_aggregator_spillea_y_finaliza_correctamente() {
+        let tmp = temp_dir("spill");
+        let dir = tmp.join("spill_dir");
+        let dir_str = dir.to_string_lossy().to_string();
+
+        // threshold = 2 => al insertar la segunda clave se hace spill
+        let mut agg = super::SpillingAggregator::new(&dir_str, 2).unwrap();
+
+        agg.add("a", 1).unwrap(); // mapa: {a:1}
+        agg.add("b", 1).unwrap(); // mapa alcanza threshold => spill; se limpia
+        agg.add("a", 2).unwrap(); // mapa: {a:2}
+
+        let out_path = tmp.join("final.csv");
+        let out_str = out_path.to_string_lossy().to_string();
+
+        agg.finalize_to_csv(&out_str).unwrap();
+
+        let content = fs::read_to_string(out_path).unwrap();
+        let mut lines: Vec<&str> = content.lines().collect();
+        lines.sort();
+
+        // de spill: a:1, b:1; de mapa final: a:2 => a:3, b:1
+        assert_eq!(lines, vec!["a,3", "b,1"]);
+    }
+
+    /* =========================
+       PIPELINES “ESTILO SPARK”
+       ========================= */
+
+    #[test]
+    fn wordcount_file_shuffled_local_end_to_end() {
+        let tmp = temp_dir("wc_file");
+        let input_path = tmp.join("input.txt");
+        let mut f = fs::File::create(&input_path).unwrap();
+        writeln!(f, "Hola hola mundo").unwrap();
+        writeln!(f, "mundo mundo prueba").unwrap();
+
+        let input_str = input_path.to_string_lossy().to_string();
+        let tmp_dir = tmp.join("tmp");
+        let tmp_str = tmp_dir.to_string_lossy().to_string();
+        let out_path = tmp.join("out.csv");
+        let out_str = out_path.to_string_lossy().to_string();
+
+        wordcount_file_shuffled_local(&input_str, &tmp_str, 3, &out_str).unwrap();
+
+        let content = fs::read_to_string(out_path).unwrap();
+        let mut lines: Vec<&str> = content.lines().collect();
+        lines.sort();
+
+        // hola x2, mundo x3, prueba x1
+        assert_eq!(lines, vec!["hola,2", "mundo,3", "prueba,1"]);
+    }
+
+    #[test]
+    fn wordcount_csv_file_shuffled_local_usa_columna_text() {
+        let tmp = temp_dir("wc_csv");
+        let csv_path = tmp.join("data.csv");
+        let mut f = fs::File::create(&csv_path).unwrap();
+        writeln!(f, "id,text").unwrap();
+        writeln!(f, "1,\"hola mundo\"").unwrap();
+        writeln!(f, "2,\"hola\"").unwrap();
+
+        let tmp_dir = tmp.join("tmp");
+        let tmp_str = tmp_dir.to_string_lossy().to_string();
+        let out_path = tmp.join("out.csv");
+        let out_str = out_path.to_string_lossy().to_string();
+
+        wordcount_csv_file_shuffled_local(
+            csv_path.to_str().unwrap(),
+            "text",
+            &tmp_str,
+            2,
+            &out_str,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(out_path).unwrap();
+        let mut lines: Vec<&str> = content.lines().collect();
+        lines.sort();
+
+        assert_eq!(lines, vec!["hola,2", "mundo,1"]);
+    }
+
+    #[test]
+    fn wordcount_jsonl_file_shuffled_local_usa_campo_text() {
+        let tmp = temp_dir("wc_jsonl");
+        let jsonl_path = tmp.join("data.jsonl");
+        let mut f = fs::File::create(&jsonl_path).unwrap();
+        writeln!(f, "{}", r#"{"text":"hola mundo"}"#).unwrap();
+        writeln!(f, "{}", r#"{"text":"hola"}"#).unwrap();
+
+        let tmp_dir = tmp.join("tmp");
+        let tmp_str = tmp_dir.to_string_lossy().to_string();
+        let out_path = tmp.join("out.csv");
+        let out_str = out_path.to_string_lossy().to_string();
+
+        wordcount_jsonl_file_shuffled_local(
+            jsonl_path.to_str().unwrap(),
+            "text",
+            &tmp_str,
+            2,
+            &out_str,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(out_path).unwrap();
+        let mut lines: Vec<&str> = content.lines().collect();
+        lines.sort();
+
+        assert_eq!(lines, vec!["hola,2", "mundo,1"]);
+    }
+
+    /* =========================
+       JOIN SOBRE PARTICIONES / CSV
+       ========================= */
+
+    #[test]
+    fn join_partitions_to_jsonl_hace_join_por_id_de_particion() {
+        let tmp = temp_dir("join_parts");
+        let base = tmp.join("stage");
+        fs::create_dir_all(&base).unwrap();
+
+        // Partición izquierda
+        let left_path = base.join("part-0-left.jsonl");
+        let mut lf = fs::File::create(&left_path).unwrap();
+        writeln!(lf, "{}", r#"{"id":"u1","a":1}"#).unwrap();
+        writeln!(lf, "{}", r#"{"id":"u2","a":2}"#).unwrap();
+
+        // Partición derecha (mismo id de partición)
+        let right_path = base.join("part-0-right.jsonl");
+        let mut rf = fs::File::create(&right_path).unwrap();
+        writeln!(rf, "{}", r#"{"id":"u1","b":10}"#).unwrap();
+
+        let left_parts = vec![Partition {
+            id: 0,
+            path: left_path.to_string_lossy().to_string(),
+        }];
+        let right_parts = vec![Partition {
+            id: 0,
+            path: right_path.to_string_lossy().to_string(),
+        }];
+
+        let out_path = tmp.join("join.jsonl");
+        let out_str = out_path.to_string_lossy().to_string();
+
+        join_partitions_to_jsonl(&left_parts, &right_parts, "id", &out_str).unwrap();
+
+        let content = fs::read_to_string(out_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1);
+
+        let rec: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(rec["id"], json!("u1"));
+        assert_eq!(rec["a"], json!(1));
+        assert_eq!(rec["b"], json!(10));
+    }
+
+    #[test]
+    fn join_csv_in_memory_hace_inner_join_por_clave() {
+        let tmp = temp_dir("join_csv");
+        let left_path = tmp.join("left.csv");
+        let right_path = tmp.join("right.csv");
+
+        let mut lf = fs::File::create(&left_path).unwrap();
+        writeln!(lf, "id,nombre").unwrap();
+        writeln!(lf, "u1,Ana").unwrap();
+        writeln!(lf, "u2,Bob").unwrap();
+
+        let mut rf = fs::File::create(&right_path).unwrap();
+        writeln!(rf, "id,compras").unwrap();
+        writeln!(rf, "u1,10").unwrap();
+        writeln!(rf, "u3,99").unwrap();
+
+        let out_path = tmp.join("out.jsonl");
+        let out_str = out_path.to_string_lossy().to_string();
+
+        join_csv_in_memory(
+            left_path.to_str().unwrap(),
+            right_path.to_str().unwrap(),
+            "id",
+            &out_str,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(out_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1);
+
+        let rec: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(rec["id"], json!("u1"));
+        assert_eq!(rec["nombre"], json!("Ana"));
+        assert_eq!(rec["compras"], json!("10")); // se leyó como string desde CSV
+    }
+}
+
+
+

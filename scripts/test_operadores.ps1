@@ -73,7 +73,7 @@ function Show-Results {
 # ============================================
 Write-Host ""
 Write-Host "#### TEST 1: MAP (CASO FELIZ) ####" -ForegroundColor Magenta
-$jobMap = Invoke-JobAndWait -JobName "test-map" -ExpectedEstado "SUCCEEDED"
+$jobMap = Invoke-JobAndWait -JobName "all" -ExpectedEstado "SUCCEEDED"
 Show-Results -JobId $jobMap
 
 Write-Host ""
