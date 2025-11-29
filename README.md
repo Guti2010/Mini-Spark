@@ -13,3 +13,7 @@ acceder al contenedor desde powershell:
 docker run --rm -it `  -v "${PWD}:/app"`
 -w /app `  rust:1.80`
 bash
+
+- Las pruebas de Cover:
+  cargo install cargo-llvm-cov --version 0.6.15
+  cargo llvm-cov -p common --lib --tests
